@@ -1,0 +1,49 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables / secrets
+.env
+.env.local
+
+# macOS junk
+.DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Project-specific: generated output
+output/
+
+# Project-specific: ML model weights (downloaded by huggingface_hub, not tracked)
+kindle_math_converter/models/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Project-specific: caches
+kindle_math_converter/cache/
+.cache/
+
+# Project-specific: test PDFs (large, not source)
+*.pdf
+!docs/*.pdf
+
+# Backup files
+*.pre-update
+*.bak

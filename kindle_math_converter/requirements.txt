@@ -1,0 +1,60 @@
+# PDF extraction
+pymupdf>=1.24.0
+pdfplumber>=0.11.0
+
+# Image processing
+Pillow>=10.0.0
+pdf2image>=1.17.0
+opencv-python>=4.9.0
+
+# Layout and formula detection
+doclayout-yolo>=0.0.2
+ultralytics>=8.0.0
+
+# Math expression recognition: equation image → LaTeX
+# pix2tex replaces unimernet — cleaner dependency tree (no eva-decord conflict).
+# CPU-only torch install (run before pip install -r requirements.txt):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+pix2tex>=0.1.2
+
+# OCR
+paddleocr>=2.7.3
+paddlepaddle>=2.6.0
+
+# LaTeX rendering
+# tectonic is invoked as a subprocess — install the binary separately:
+# macOS: brew install tectonic
+# Linux: cargo install tectonic  OR  https://tectonic-typesetting.github.io/en-US/install.html
+# dvisvgm is similarly a binary: brew install dvisvgm  /  apt install dvisvgm
+
+# SVG processing
+lxml>=5.2.0
+svgpathtools>=1.6.1
+
+# EPUB assembly
+ebooklib>=0.18
+
+# Validation
+# epubcheck is a Java jar invoked as a subprocess — must be installed separately.
+# See: https://github.com/w3c/epubcheck
+
+# Reporting
+jinja2>=3.1.0
+rich>=13.0.0
+
+# Model weight management (auto-download from HuggingFace Hub)
+huggingface_hub>=0.23.0
+
+# Utilities
+pydantic>=2.0.0
+structlog>=24.0.0
+click>=8.1.0
+
+# QA — simplified CDM (SSIM)
+scikit-image>=0.22.0
+
+# Optional: visual diff in report (cairosvg for SVG rasterization)
+# cairosvg>=2.7.0
+
+# Optional: Mathpix fallback (Stage 8B)
+# requests>=2.31.0

@@ -1,0 +1,73 @@
+/* Kindle Math Converter — base EPUB stylesheet */
+
+/* Target KF8/KFX (modern Kindle format) */
+@media amzn-kf8 {
+  body {
+    font-family: serif;
+    line-height: 1.5;
+    margin: 0 5%;
+  }
+
+  .eq-inline {
+    display: inline-block;
+    vertical-align: middle;
+  }
+
+  .eq-display {
+    display: block;
+    text-align: center;
+    margin: 1em 0;
+    page-break-inside: avoid;
+  }
+
+  .eq-display svg {
+    max-width: 100%;
+  }
+
+  .eq-number {
+    float: right;
+    margin-right: 2em;
+    font-style: normal;
+  }
+
+  .eq-flagged {
+    color: #cc0000;
+    font-family: monospace;
+    font-size: 0.8em;
+    border: 1px solid #cc0000;
+    padding: 0 4px;
+  }
+}
+
+/* Fallback for all other EPUB readers */
+body {
+  font-family: serif;
+  line-height: 1.5;
+}
+
+.eq-inline {
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.eq-display {
+  display: block;
+  text-align: center;
+  margin: 1em 0;
+}
+
+.eq-display svg {
+  max-width: 100%;
+}
+
+.eq-number {
+  float: right;
+  margin-right: 2em;
+}
+
+.eq-flagged {
+  color: #cc0000;
+  font-family: monospace;
+  border: 1px solid #cc0000;
+  padding: 0 4px;
+}
