@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from ..models.document import Document, Page, EquationRegion, BoundingBox
+from ..models.document import Document, Page, EquationRegion, TextBlock, BoundingBox
 from ..models.enums import FormulaClass, ErrorCode
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
@@ -17,12 +17,21 @@ from ..observability.logger import get_logger
 log = get_logger("s03_detection")
 
 FORMULA_DETECTION_CONFIDENCE_DEFAULT = 0.35
+TEXT_DETECTION_CONFIDENCE_DEFAULT = 0.35
 
 # Minimum crop dimensions in pixels to be considered a real equation.
 # At 300 DPI, 1pt ≈ 4.17 px. A lone punctuation mark (©, ?, hyphen) typically
 # occupies < 20×20 px. Real inline equations are at least ~25px wide and ~12px tall.
 MIN_EQUATION_WIDTH_PX  = 20
 MIN_EQUATION_HEIGHT_PX = 12
+
+# DocLayout-YOLO (DocStructBench) class names that carry readable body text.
+# Excludes: "abandon" (headers/footers/page numbers), "figure", "table",
+# and "isolate_formula" (equations are YOLOv8-MFD's job).
+TEXT_LAYOUT_CLASSES = frozenset({
+    "title", "plain text", "figure_caption", "table_caption",
+    "table_footnote", "formula_caption",
+})
 
 
 @dataclass
@@ -62,6 +71,46 @@ def _crop_image(pil_img, x0: float, y0: float, x1: float, y1: float, padding: in
     return buf.getvalue()
 
 
+def _crop_and_mask_text(
+    pil_img,
+    tx0: float, ty0: float, tx1: float, ty1: float,
+    equation_px_boxes: list[tuple[float, float, float, float]],
+    padding: int = 4,
+    mask_margin: int = 2,
+) -> bytes:
+    """
+    Crops a text region and whitewashes any overlapping equation pixels so the
+    OCR engine never sees garbled inline-math glyphs (the equation is rendered
+    separately as SVG). Returns PNG bytes.
+    """
+    from PIL import Image, ImageDraw
+
+    width, height = pil_img.size
+    cx0 = max(0, int(tx0) - padding)
+    cy0 = max(0, int(ty0) - padding)
+    cx1 = min(width, int(tx1) + padding)
+    cy1 = min(height, int(ty1) + padding)
+
+    crop = pil_img.crop((cx0, cy0, cx1, cy1)).convert("L")
+    draw = ImageDraw.Draw(crop)
+
+    for ex0, ey0, ex1, ey1 in equation_px_boxes:
+        # Skip equations that don't overlap this text region at all.
+        if ex1 <= cx0 or ex0 >= cx1 or ey1 <= cy0 or ey0 >= cy1:
+            continue
+        # Translate to crop-local coords and paint white (255), with a small margin.
+        rx0 = max(0, int(ex0) - cx0 - mask_margin)
+        ry0 = max(0, int(ey0) - cy0 - mask_margin)
+        rx1 = min(crop.width, int(ex1) - cx0 + mask_margin)
+        ry1 = min(crop.height, int(ey1) - cy0 + mask_margin)
+        if rx1 > rx0 and ry1 > ry0:
+            draw.rectangle([rx0, ry0, rx1, ry1], fill=255)
+
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _rasterize_pdf_page_for_detection(pdf_path: str, page_num: int, dpi: int = 150) -> bytes:
     """Rasterizes a single PDF page at low DPI just for detection (not OCR)."""
     import pymupdf  # type: ignore
@@ -78,12 +127,14 @@ def run(
     models: ModelBundle,
     bus: EventBus,
     formula_confidence_threshold: float = FORMULA_DETECTION_CONFIDENCE_DEFAULT,
+    text_confidence_threshold: float = TEXT_DETECTION_CONFIDENCE_DEFAULT,
 ) -> tuple[Document, StageResult]:
     t0 = time.perf_counter()
     stage = "s03_detection"
     warnings: list[str] = []
     errors: list[str] = []
     total_detected = 0
+    total_text_detected = 0
 
     bus.emit(stage, "stage_start")
     log.info("stage_start", pages=len(document.pages))
@@ -126,6 +177,8 @@ def run(
                 continue
 
             eq_index = len(page.equation_regions)
+            # Accepted equation pixel bboxes — used to mask math out of text crops below.
+            equation_px_boxes: list[tuple[float, float, float, float]] = []
 
             for det in detections:
                 if det["confidence"] < formula_confidence_threshold:
@@ -155,6 +208,7 @@ def run(
                 )
 
                 crop_bytes = _crop_image(pil_img, px_x0, px_y0, px_x1, px_y1)
+                equation_px_boxes.append((px_x0, px_y0, px_x1, px_y1))
 
                 # Convert to PDF point coordinate system
                 bbox = BoundingBox(
@@ -191,9 +245,55 @@ def run(
                     confidence=det["confidence"],
                 )
 
+            # ── Body-text region detection (DocLayout-YOLO) ──────────────────
+            # Populates page.text_blocks with equation pixels masked out, so the
+            # OCR stage (s05a) never sees garbled inline math. Skipped silently if
+            # the layout model is unavailable.
+            if models.layout_model is not None:
+                try:
+                    text_dets = _run_layout_detection(models.layout_model, pil_img)
+                except Exception as exc:
+                    warnings.append(f"Page {page.page_number} layout detection failed: {exc}")
+                    log.warning("layout_detection_failed", page=page.page_number, error=str(exc))
+                    text_dets = []
+
+                tb_index = len(page.text_blocks)
+                for det in text_dets:
+                    if det["confidence"] < text_confidence_threshold:
+                        continue
+
+                    tx0, ty0, tx1, ty1 = det["bbox"]
+                    if (tx1 - tx0) < MIN_EQUATION_WIDTH_PX or (ty1 - ty0) < MIN_EQUATION_HEIGHT_PX:
+                        continue
+
+                    masked_crop = _crop_and_mask_text(
+                        pil_img, tx0, ty0, tx1, ty1, equation_px_boxes
+                    )
+
+                    text_bbox = BoundingBox(
+                        x0=tx0 * px_to_pt_x,
+                        y0=ty0 * px_to_pt_y,
+                        x1=tx1 * px_to_pt_x,
+                        y1=ty1 * px_to_pt_y,
+                        coordinate_system="pdf_points",
+                        page_number=page.page_number,
+                    )
+
+                    page.text_blocks.append(TextBlock(
+                        block_id=f"tb_{page.page_number}_{tb_index}",
+                        bbox=text_bbox,
+                        raw_text="",                # filled by s05a OCR
+                        reading_order_index=tb_index,
+                        source_image_crop=masked_crop,
+                    ))
+                    tb_index += 1
+                    total_text_detected += 1
+
         duration_ms = round((time.perf_counter() - t0) * 1000, 2)
-        bus.emit(stage, "stage_end", equations_detected=total_detected)
-        log.info("stage_end", equations_detected=total_detected)
+        bus.emit(stage, "stage_end", equations_detected=total_detected,
+                 text_blocks_detected=total_text_detected)
+        log.info("stage_end", equations_detected=total_detected,
+                 text_blocks_detected=total_text_detected)
 
         return document, StageResult(
             stage_name=stage,
@@ -201,7 +301,10 @@ def run(
             duration_ms=duration_ms,
             warnings=warnings,
             errors=errors,
-            metrics={"equations_detected": total_detected},
+            metrics={
+                "equations_detected": total_detected,
+                "text_blocks_detected": total_text_detected,
+            },
         )
 
     except Exception as exc:
@@ -244,6 +347,36 @@ def _run_formula_detection(formula_model, pil_img) -> list[dict]:
             detections.append({
                 "bbox": (x1, y1, x2, y2),
                 "confidence": conf,
+                "class_name": class_name,
+            })
+    return detections
+
+
+def _run_layout_detection(layout_model, pil_img) -> list[dict]:
+    """
+    Runs DocLayout-YOLO on a PIL image and returns only text-bearing regions.
+    Returns list of dicts with keys: bbox (x0,y0,x1,y1), confidence, class_name.
+
+    Class names are read from layout_model.names (e.g. {0:'title', 1:'plain text',
+    8:'isolate_formula', ...}) and filtered by TEXT_LAYOUT_CLASSES — robust to any
+    class-id reordering between model versions.
+    """
+    names = getattr(layout_model, "names", {}) or {}
+    results = layout_model(pil_img)
+    detections = []
+    for result in results:
+        boxes = result.boxes
+        if boxes is None:
+            continue
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            class_name = names.get(cls_id, str(cls_id))
+            if class_name not in TEXT_LAYOUT_CLASSES:
+                continue
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            detections.append({
+                "bbox": (x1, y1, x2, y2),
+                "confidence": float(box.conf[0]),
                 "class_name": class_name,
             })
     return detections

@@ -95,17 +95,22 @@ def _page_to_xhtml(page: Page, title: str) -> str:
 
     body_parts = []
 
-    # Sort all content by approximate y position
-    all_items: list[tuple[float, str]] = []
+    # Order content by the unified reading_order_index assigned in Stage 4
+    # (column-aware). Fall back to vertical position when the index is absent.
+    all_items: list[tuple[float, float, str]] = []
 
     for block in page.text_blocks:
-        all_items.append((block.bbox.y0, f"<p>{_escape_text(block.raw_text)}</p>"))
+        if not block.raw_text.strip():
+            continue  # skip blocks where OCR produced nothing
+        order = block.reading_order_index if block.reading_order_index is not None else block.bbox.y0
+        all_items.append((order, block.bbox.y0, f"<p>{_escape_text(block.raw_text)}</p>"))
 
     for region in page.equation_regions:
-        all_items.append((region.bbox.y0, _render_equation(region)))
+        order = region.reading_order_index if region.reading_order_index is not None else region.bbox.y0
+        all_items.append((order, region.bbox.y0, _render_equation(region)))
 
-    all_items.sort(key=lambda x: x[0])
-    body_parts = [html for _, html in all_items]
+    all_items.sort(key=lambda x: (x[0], x[1]))
+    body_parts = [html for _, _, html in all_items]
 
     if not body_parts:
         body_parts = ["<p>&#160;</p>"]

@@ -45,25 +45,18 @@ def run(
 
     try:
         import io
+        import numpy as np  # type: ignore
         from PIL import Image  # type: ignore
 
         for page in document.pages:
-            if not page.image_bytes:
-                continue
-
-            pil_img = Image.open(io.BytesIO(page.image_bytes)).convert("RGB")
-
             for block in page.text_blocks:
-                # Crop text block region
-                bbox = block.bbox
-                crop = pil_img.crop((
-                    max(0, int(bbox.x0)),
-                    max(0, int(bbox.y0)),
-                    min(pil_img.width, int(bbox.x1)),
-                    min(pil_img.height, int(bbox.y1)),
-                ))
+                # OCR the masked crop produced in Stage 3 (equation pixels already
+                # whitewashed). We do NOT re-crop from the page image: block.bbox is in
+                # PDF points, not pixels, so cropping with it would be wrong.
+                if not block.source_image_crop:
+                    continue
 
-                import numpy as np  # type: ignore
+                crop = Image.open(io.BytesIO(block.source_image_crop)).convert("RGB")
                 crop_array = np.array(crop)
 
                 # PaddleOCR 3.x: cls= removed; orientation set via use_textline_orientation in constructor

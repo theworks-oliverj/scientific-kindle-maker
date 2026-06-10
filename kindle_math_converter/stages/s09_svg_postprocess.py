@@ -101,11 +101,39 @@ def clean_for_inline_embedding(svg: str) -> str:
     return svg.strip()
 
 
-def postprocess_svg(svg: str, body_font_size_pt: float = 10.0) -> str:
+def namespace_svg_ids(svg: str, prefix: str) -> str:
+    """
+    Makes every glyph id in this SVG unique to one equation by prefixing it.
+
+    dvisvgm numbers glyph definitions (<path id="gN-MM">) locally per render, so
+    when many equation SVGs are inlined into one XHTML document the same id="gN-MM"
+    repeats — an xs:ID uniqueness violation (epubcheck error; some readers reject the
+    file) and a <use href="#gN-MM"> that resolves to the wrong glyph.
+
+    We rewrite both the id declarations and the internal href="#..." references
+    consistently. Only internal fragment refs (href="#X") are touched — dvisvgm emits
+    nothing else. Must run AFTER clean_for_inline_embedding (which has already converted
+    xlink:href -> href), so only the plain href= form remains.
+
+    prefix is the region_id (e.g. "eq_3_36"), already an XML-safe NCName.
+    """
+    # Collect declared ids
+    ids = re.findall(r'\bid="([^"]+)"', svg)
+    for old_id in set(ids):
+        new_id = f"{prefix}__{old_id}"
+        # Rewrite the declaration and any internal reference to it.
+        svg = re.sub(rf'\bid="{re.escape(old_id)}"', f'id="{new_id}"', svg)
+        svg = re.sub(rf'href="#{re.escape(old_id)}"', f'href="#{new_id}"', svg)
+    return svg
+
+
+def postprocess_svg(svg: str, body_font_size_pt: float = 10.0, prefix: str | None = None) -> str:
     svg = strip_font_size_css(svg)
     svg = set_em_dimensions(svg, body_font_size_pt)
     svg = apply_current_color(svg)
     svg = clean_for_inline_embedding(svg)
+    if prefix:
+        svg = namespace_svg_ids(svg, prefix)
     return svg
 
 
@@ -129,7 +157,7 @@ def run(
             continue
 
         try:
-            region.svg_postprocessed = postprocess_svg(region.svg, body_font_size_pt)
+            region.svg_postprocessed = postprocess_svg(region.svg, body_font_size_pt, region.region_id)
             processed += 1
             bus.emit(stage, "equation_ok", equation_id=region.region_id)
         except Exception as exc:

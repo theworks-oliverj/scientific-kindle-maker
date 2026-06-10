@@ -47,45 +47,20 @@ def run(
             if not all_regions:
                 continue
 
-            if layout == ColumnLayout.SINGLE or layout == ColumnLayout.MIXED:
-                sorted_regions = sorted(all_regions, key=lambda r: (r.bbox.y0, r.bbox.x0))
-                for idx, region in enumerate(sorted_regions):
-                    if isinstance(region, TextBlock):
-                        region.reading_order_index = idx
-                    # EquationRegion does not have reading_order_index field;
-                    # position is implicit from page order + equation_regions list order
+            if layout == ColumnLayout.DOUBLE:
+                ordered, n_spanning = _order_double_column(all_regions, page.width_pt)
+                ambiguous_count += n_spanning
+                if n_spanning:
+                    warnings.append(
+                        f"Page {page.page_number}: {n_spanning} region(s) span the column boundary"
+                    )
+            else:  # SINGLE or MIXED
+                ordered = sorted(all_regions, key=lambda r: (r.bbox.y0, r.bbox.x0))
 
-            elif layout == ColumnLayout.DOUBLE:
-                page_mid = page.width_pt / 2
-                left_col = []
-                right_col = []
-                spanning = []
-
-                for region in all_regions:
-                    center_x = (region.bbox.x0 + region.bbox.x1) / 2
-                    crosses_boundary = region.bbox.x0 < page_mid and region.bbox.x1 > page_mid
-                    if crosses_boundary:
-                        spanning.append(region)
-                        warnings.append(
-                            f"Page {page.page_number}: region spans column boundary"
-                        )
-                        ambiguous_count += 1
-                    elif center_x < page_mid:
-                        left_col.append(region)
-                    else:
-                        right_col.append(region)
-
-                left_col.sort(key=lambda r: r.bbox.y0)
-                right_col.sort(key=lambda r: r.bbox.y0)
-
-                ordered = left_col + right_col + spanning
-                for idx, region in enumerate(ordered):
-                    if isinstance(region, TextBlock):
-                        region.reading_order_index = idx
-
-            # Assign reading_order_index to equation_regions in page order
-            sorted_eq = sorted(page.equation_regions, key=lambda r: (r.bbox.y0, r.bbox.x0))
-            page.equation_regions = sorted_eq
+            # Assign a unified reading order to BOTH text blocks and equations so
+            # Stage 10 can interleave them correctly (esp. double-column pages).
+            for idx, region in enumerate(ordered):
+                region.reading_order_index = idx
 
             # Extract equation numbers from nearby text blocks
             _assign_equation_numbers(page.equation_regions, page.text_blocks, page.width_pt)
@@ -117,6 +92,51 @@ def run(
             duration_ms=duration_ms,
             errors=errors,
         )
+
+
+def _order_double_column(
+    regions: list[TextBlock | EquationRegion],
+    page_width_pt: float,
+) -> tuple[list[TextBlock | EquationRegion], int]:
+    """
+    Orders a double-column page using band segmentation.
+
+    A full-width region (one that crosses the column midline, e.g. a display
+    equation spanning both columns) acts as a horizontal band break: everything
+    above it is read left-column-then-right-column, then the full-width region is
+    emitted at its vertical position, then the next band begins. This keeps a
+    centered display equation in its correct reading position instead of being
+    dumped at the end of the page (the previous behaviour).
+
+    Returns (ordered_regions, spanning_count).
+    """
+    mid = page_width_pt / 2
+    ordered: list[TextBlock | EquationRegion] = []
+    left: list[TextBlock | EquationRegion] = []
+    right: list[TextBlock | EquationRegion] = []
+    spanning_count = 0
+
+    def flush_band() -> None:
+        left.sort(key=lambda r: r.bbox.y0)
+        right.sort(key=lambda r: r.bbox.y0)
+        ordered.extend(left)
+        ordered.extend(right)
+        left.clear()
+        right.clear()
+
+    for region in sorted(regions, key=lambda r: r.bbox.y0):
+        crosses = region.bbox.x0 < mid and region.bbox.x1 > mid
+        if crosses:
+            flush_band()
+            ordered.append(region)
+            spanning_count += 1
+        elif (region.bbox.x0 + region.bbox.x1) / 2 < mid:
+            left.append(region)
+        else:
+            right.append(region)
+
+    flush_band()
+    return ordered, spanning_count
 
 
 def _assign_equation_numbers(

@@ -29,15 +29,17 @@ dist/
 # Project-specific: generated output
 output/
 
-# Project-specific: ML model weights (downloaded by huggingface_hub, not tracked)
-kindle_math_converter/models/
+# Project-specific: ML model weights (downloaded by huggingface_hub at runtime,
+# stored under ~/.kindle_converter/models/ — NOT inside the repo). Do NOT ignore
+# kindle_math_converter/models/: that directory is source code (document.py,
+# enums.py, results.py), not weights.
 *.pt
 *.pth
 *.onnx
 *.safetensors
 
-# Project-specific: caches
-kindle_math_converter/cache/
+# Project-specific: equation render cache (runtime data only). Do NOT ignore
+# kindle_math_converter/cache/: that directory is source code (equation_cache.py).
 .cache/
 
 # Project-specific: test PDFs (large, not source)
