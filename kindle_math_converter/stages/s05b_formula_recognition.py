@@ -358,15 +358,26 @@ def _simple_text_repr(latex: str) -> Optional[str]:
 
 # ── Stage 1.4: reference/footnote-marker filter ───────────────────────────
 
-_GREEK_STRIP_RES = [(re.compile(rf'\\{name}\b'), ch) for name, ch in _GREEK_MAP.items()]
+# `\b` does not work as a terminator here: `\psi_{2}` has no word boundary
+# between "psi" and "_" (both are \w), so `\\psi\b` fails to match and the
+# whole `\psi_{2}` falls through to _LATEX_COMMAND_RE, which strips `\psi`
+# as a bare command and loses the symbol entirely. A negative lookahead for
+# another ASCII letter has the same "don't match a longer macro name" effect
+# as `\b` without that failure mode.
+_GREEK_STRIP_RES = [(re.compile(rf'\\{name}(?![A-Za-z])'), ch) for name, ch in _GREEK_MAP.items()]
 _LATEX_COMMAND_RE = re.compile(r'\\[a-zA-Z]+|\\[!,;:]')
 _SUBSUP_MARKER_RE = re.compile(r'[\^_]')
 _BRACE_RE = re.compile(r'[{}]')
 
-_EQUATION_NUMBER_LABEL_RE = re.compile(r'^\(?\s*\d+(?:\.\d+)*\s*\)?$')
-_FOOTNOTE_MARKER_RE = re.compile(
-    r'^(\d{1,3}[A-Za-zΑ-ω]{0,4}[.,]?|[A-Za-z]{1,2}\d{1,3}[.,]?)$'
-)
+# Equation-number labels require parens, mirroring s04's EQ_NUMBER_PATTERN —
+# a bare digit string (e.g. a stripped "\psi_{2}" -> "2") is not a label.
+_EQUATION_NUMBER_LABEL_RE = re.compile(r'^\(\s*\d+(?:\.\d+)*\s*\)$')
+# Letter(s)-then-digits (e.g. "S20") is deliberately NOT matched here: it also
+# matches common physics variable names like "B1", "B2", "S2" (subscripted
+# symbols such as B_1, |B_2\rangle, \mathfrak{S}_2), which would be silently
+# dropped from the EPUB if flagged as reference labels. Digit-led markers
+# (footnote numbers like "34A.", "60See.") are unambiguous and kept.
+_FOOTNOTE_MARKER_RE = re.compile(r'^\d{1,3}[A-Za-zΑ-ω]{0,4}[.,]?$')
 
 
 def _strip_latex_formatting(latex: str) -> str:
