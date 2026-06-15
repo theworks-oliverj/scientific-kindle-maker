@@ -33,6 +33,10 @@ def run(
     fallback_list: list[EquationRegion] = []
 
     for region in document.all_equations:
+        # Handled outside the SVG pipeline (Stage 5B) — never reach 8A/8B
+        if region.render_as_text or region.is_reference_label or region.dedup_canonical_id is not None:
+            continue
+
         gate = region.confidence_gate
         if gate == ConfidenceGate.PASS or gate == ConfidenceGate.REPAIR:
             pass_list.append(region)

@@ -9,6 +9,7 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from ..models.document import Document, Page, EquationRegion, TextBlock
 from ..models.enums import FormulaClass, ConfidenceGate, ErrorCode
@@ -44,6 +45,9 @@ BOOK_CSS = """\
     border: 1px solid #cc0000;
     padding: 0 4px;
   }
+  .eq-text {
+    white-space: nowrap;
+  }
 }
 
 /* Fallback for non-Kindle EPUB readers */
@@ -51,6 +55,7 @@ BOOK_CSS = """\
 .eq-display { display: block; text-align: center; margin: 1em 0; }
 .eq-display svg { max-width: 100%; }
 .eq-flagged { color: #cc0000; font-family: monospace; border: 1px solid #cc0000; padding: 0 4px; }
+.eq-text { white-space: nowrap; }
 """
 
 XHTML_TEMPLATE = """\
@@ -69,13 +74,22 @@ XHTML_TEMPLATE = """\
 """
 
 
-def _render_equation(region: EquationRegion) -> str:
-    """Returns the HTML snippet for one equation region."""
+def _render_equation(region: EquationRegion) -> Optional[str]:
+    """
+    Returns the HTML snippet for one equation region, or None if the region
+    should be omitted from the page entirely (reference/footnote labels
+    already present in the surrounding body text, and irrecoverably flagged
+    equations — neither should leak a raw [EQ:...] placeholder into the
+    reading flow).
+    """
+    if region.render_as_text:
+        return f'<span class="eq-text">{region.inline_text_repr}</span>'
+
+    if region.is_reference_label:
+        return None
+
     if region.flagged_for_review or not region.svg_postprocessed:
-        return (
-            f'<span class="eq-flagged" data-eq-id="{region.region_id}" '
-            f'title="Review required">[EQ:{region.region_id}]</span>'
-        )
+        return None
 
     svg = region.svg_postprocessed
 
@@ -88,7 +102,7 @@ def _render_equation(region: EquationRegion) -> str:
         return f'<div class="eq-display">{svg}{number_html}</div>'
 
 
-def _page_to_xhtml(page: Page, title: str) -> str:
+def _page_to_xhtml(page: Page, title: str, bus: EventBus) -> str:
     """Converts a page's text blocks and equations into XHTML body content."""
     # Build a combined reading-order list of text and equations
     # For pages from PDF/scanned sources, interleave text and equations by y-position
@@ -106,8 +120,16 @@ def _page_to_xhtml(page: Page, title: str) -> str:
         all_items.append((order, block.bbox.y0, f"<p>{_escape_text(block.raw_text)}</p>"))
 
     for region in page.equation_regions:
+        html = _render_equation(region)
+        if html is None:
+            if region.flagged_for_review and not region.is_reference_label:
+                bus.emit(
+                    "s10_epub_assembly", "equation_skipped",
+                    equation_id=region.region_id, reason="flagged_no_render",
+                )
+            continue
         order = region.reading_order_index if region.reading_order_index is not None else region.bbox.y0
-        all_items.append((order, region.bbox.y0, _render_equation(region)))
+        all_items.append((order, region.bbox.y0, html))
 
     all_items.sort(key=lambda x: (x[0], x[1]))
     body_parts = [html for _, _, html in all_items]
@@ -276,7 +298,7 @@ def run(
 
         # Generate XHTML for each page/chapter
         chapters_xhtml = [
-            _page_to_xhtml(page, title)
+            _page_to_xhtml(page, title, bus)
             for page in document.pages
         ]
 

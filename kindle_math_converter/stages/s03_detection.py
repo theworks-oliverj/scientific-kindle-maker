@@ -4,9 +4,11 @@ Runs DocLayout-YOLO and YOLOv8-MFD on page images to detect equation regions.
 Failure mode: Fatal.
 """
 import io
+import json
 import time
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 from ..models.document import Document, Page, EquationRegion, TextBlock, BoundingBox
 from ..models.enums import FormulaClass, ErrorCode
@@ -111,6 +113,19 @@ def _crop_and_mask_text(
     return buf.getvalue()
 
 
+def _dump_debug_crop(
+    pil_img,
+    debug_dir: Path,
+    page_number: int,
+    name: str,
+    x0: float, y0: float, x1: float, y1: float,
+) -> None:
+    """Writes a labeled crop PNG to `debug_dir/page_<NN>/<name>.png` for Stage 1.1's audit dump."""
+    page_dir = debug_dir / f"page_{page_number:02d}"
+    page_dir.mkdir(parents=True, exist_ok=True)
+    (page_dir / f"{name}.png").write_bytes(_crop_image(pil_img, x0, y0, x1, y1))
+
+
 def _rasterize_pdf_page_for_detection(pdf_path: str, page_num: int, dpi: int = 150) -> bytes:
     """Rasterizes a single PDF page at low DPI just for detection (not OCR)."""
     import pymupdf  # type: ignore
@@ -128,6 +143,7 @@ def run(
     bus: EventBus,
     formula_confidence_threshold: float = FORMULA_DETECTION_CONFIDENCE_DEFAULT,
     text_confidence_threshold: float = TEXT_DETECTION_CONFIDENCE_DEFAULT,
+    debug_dump_dir: Optional[str] = None,
 ) -> tuple[Document, StageResult]:
     t0 = time.perf_counter()
     stage = "s03_detection"
@@ -135,6 +151,9 @@ def run(
     errors: list[str] = []
     total_detected = 0
     total_text_detected = 0
+
+    debug_dir = Path(debug_dump_dir) if debug_dump_dir else None
+    detection_records: list[dict] = []
 
     bus.emit(stage, "stage_start")
     log.info("stage_start", pages=len(document.pages))
@@ -180,11 +199,23 @@ def run(
             # Accepted equation pixel bboxes — used to mask math out of text crops below.
             equation_px_boxes: list[tuple[float, float, float, float]] = []
 
-            for det in detections:
+            for det_index, det in enumerate(detections):
                 if det["confidence"] < formula_confidence_threshold:
                     continue
 
                 px_x0, px_y0, px_x1, px_y1 = det["bbox"]
+
+                record: Optional[dict] = None
+                if debug_dir is not None:
+                    record = {
+                        "page": page.page_number,
+                        "det_index": det_index,
+                        "class_name": det.get("class_name"),
+                        "confidence": round(det["confidence"], 4),
+                        "bbox_px": [round(px_x0, 1), round(px_y0, 1), round(px_x1, 1), round(px_y1, 1)],
+                        "width_px": round(px_x1 - px_x0, 1),
+                        "height_px": round(px_y1 - px_y0, 1),
+                    }
 
                 # Size filter: reject detections too small to be a real equation
                 # (false positives: ©, ?, lone dash, apostrophe).
@@ -199,6 +230,14 @@ def run(
                         width=round(px_w, 1),
                         height=round(px_h, 1),
                     )
+                    if record is not None and debug_dir is not None:
+                        record["status"] = "too_small"
+                        record["region_id"] = None
+                        detection_records.append(record)
+                        _dump_debug_crop(
+                            pil_img, debug_dir, page.page_number,
+                            f"det_{det_index}_too_small", px_x0, px_y0, px_x1, px_y1,
+                        )
                     continue
 
                 formula_class = (
@@ -236,6 +275,16 @@ def run(
                 page.equation_regions.append(region)
                 eq_index += 1
                 total_detected += 1
+
+                if record is not None and debug_dir is not None:
+                    record["status"] = "accepted"
+                    record["region_id"] = region.region_id
+                    record["formula_class"] = formula_class.value
+                    detection_records.append(record)
+                    _dump_debug_crop(
+                        pil_img, debug_dir, page.page_number,
+                        region.region_id, px_x0, px_y0, px_x1, px_y1,
+                    )
 
                 bus.emit(
                     stage,
@@ -288,6 +337,12 @@ def run(
                     ))
                     tb_index += 1
                     total_text_detected += 1
+
+        if debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            with open(debug_dir / "detections.jsonl", "w") as f:
+                for rec in detection_records:
+                    f.write(json.dumps(rec) + "\n")
 
         duration_ms = round((time.perf_counter() - t0) * 1000, 2)
         bus.emit(stage, "stage_end", equations_detected=total_detected,

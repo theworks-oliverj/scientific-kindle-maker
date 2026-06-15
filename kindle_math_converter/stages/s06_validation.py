@@ -460,6 +460,10 @@ def run(
     is_scanned = document.metadata.source_type == SourceType.VISUAL_PDF
 
     for region in document.all_equations:
+        # ── Skip regions handled outside the SVG pipeline (Stage 5B) ────
+        if region.render_as_text or region.is_reference_label or region.dedup_canonical_id is not None:
+            continue
+
         # ── No LaTeX at all (recognition failed upstream) ───────────────
         if not region.raw_latex:
             region.confidence_gate = ConfidenceGate.FALLBACK

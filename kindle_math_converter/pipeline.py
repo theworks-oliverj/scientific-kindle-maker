@@ -66,6 +66,9 @@ class PipelineConfig:
     epubcheck_enabled: bool = True
     # Cache dump
     dump_cache: bool = False
+    # Debug dump (Stage 3/5B detection & recognition audit trail)
+    s03_debug_dump_enabled: bool = False
+    s03_debug_dump_dir: Optional[str] = None
 
 
 class Pipeline:
@@ -135,6 +138,10 @@ class Pipeline:
         cfg = self.config
         out_dir = Path(output_dir)
 
+        debug_dump_dir: Optional[str] = None
+        if cfg.s03_debug_dump_enabled:
+            debug_dump_dir = cfg.s03_debug_dump_dir or str(out_dir / "debug_crops")
+
         # Stage 1: Input classification (fatal on failure)
         metadata, sr1 = s01_classifier.run(input_path, self.bus)
         result.stage_results.append(sr1)
@@ -165,6 +172,7 @@ class Pipeline:
                 model_bundle,
                 self.bus,
                 formula_confidence_threshold=cfg.formula_detection_confidence,
+                debug_dump_dir=debug_dump_dir,
             )
             result.stage_results.append(sr3)
             if not sr3.ok:
@@ -179,7 +187,9 @@ class Pipeline:
         result.stage_results.append(sr5a)
 
         # Stage 5B: Formula recognition (non-fatal per equation)
-        document, sr5b = s05b_formula_recognition.run(document, self.models.get("pix2tex"), self.bus)
+        document, sr5b = s05b_formula_recognition.run(
+            document, self.models.get("pix2tex"), self.bus, debug_dump_dir=debug_dump_dir,
+        )
         result.stage_results.append(sr5b)
 
         # Stage 6: LaTeX validation and repair (non-fatal per equation)
@@ -202,6 +212,7 @@ class Pipeline:
             pass_list,
             self.cache,
             self.bus,
+            document=document,
             tectonic_timeout=cfg.tectonic_timeout_s,
             dvisvgm_timeout=cfg.dvisvgm_timeout_s,
         )

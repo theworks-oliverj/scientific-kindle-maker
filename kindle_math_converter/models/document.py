@@ -65,6 +65,10 @@ class EquationRegion:
     error_codes: list[str] = field(default_factory=list)
     failure_reason: Optional[FailureReason] = None
     reading_order_index: Optional[int] = None  # Set in Stage 4 (unified with text blocks)
+    dedup_canonical_id: Optional[str] = None   # Set in Stage 5B: region_id of canonical duplicate
+    is_reference_label: bool = False           # Set in Stage 5B: looks like a footnote/reference marker
+    render_as_text: bool = False               # Set in Stage 5B: simple enough to render as HTML text
+    inline_text_repr: Optional[str] = None     # Set in Stage 5B: HTML text repr when render_as_text
 
 
 @dataclass

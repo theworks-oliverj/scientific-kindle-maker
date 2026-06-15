@@ -87,6 +87,9 @@ def download_models_cmd(models_dir: str | None) -> None:
               help="Write cache dump JSON to output dir after completion.")
 @click.option("--no-epubcheck", is_flag=True, default=False,
               help="Skip epubcheck validation (useful if Java is not available).")
+@click.option("--debug-dump", is_flag=True, default=False,
+              help="Write per-detection crops and detections/recognition JSONL "
+                   "to <output-dir>/debug_crops for auditing Stage 3/5B.")
 def main(
     input_path: str,
     output_dir: str,
@@ -98,6 +101,7 @@ def main(
     open_report: bool,
     dump_cache: bool,
     no_epubcheck: bool,
+    debug_dump: bool,
 ) -> None:
     """
     Convert a PDF or EPUB to Kindle-compatible EPUB3 with properly rendered
@@ -127,6 +131,7 @@ def main(
         verbose_logging=verbose,
         dump_cache=dump_cache,
         epubcheck_enabled=not no_epubcheck,
+        s03_debug_dump_enabled=debug_dump,
     )
 
     console.print(f"\n[bold]Kindle Math Converter[/bold]")

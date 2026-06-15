@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from ..cache.equation_cache import SessionEquationCache
-from ..models.document import EquationRegion, FailureReason
+from ..models.document import Document, EquationRegion, FailureReason
 from ..models.enums import ConfidenceGate, ErrorCode, FormulaClass
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
@@ -167,6 +167,7 @@ def run(
     pass_list: list[EquationRegion],
     cache: SessionEquationCache,
     bus: EventBus,
+    document: Document | None = None,
     tectonic_timeout: int = 15,
     dvisvgm_timeout: int = 10,
 ) -> tuple[list[EquationRegion], list[EquationRegion], StageResult]:
@@ -256,9 +257,29 @@ def run(
             warnings.append(f"{region.region_id}: dvisvgm failed — {exc}")
             bus.emit(stage, "equation_error", equation_id=region.region_id, error=str(exc))
 
+    # ── Stage 1.3: copy the canonical's raw SVG to its dedup duplicates ────
+    # Duplicates never appear in pass_list (filtered out in Stage 7), so they
+    # need to be reached via `document`. Only the RAW svg is copied — each
+    # duplicate has its own region_id, so Stage 9's per-region
+    # namespace_svg_ids() call produces distinct glyph ids for it.
+    dedup_copies = 0
+    if document is not None:
+        canonical_by_id = {r.region_id: r for r in pass_list if r.svg is not None}
+        for region in document.all_equations:
+            if region.dedup_canonical_id is None:
+                continue
+            canonical = canonical_by_id.get(region.dedup_canonical_id)
+            if canonical is None:
+                continue
+            region.svg = canonical.svg
+            region.cdm_score = canonical.cdm_score
+            region.confidence_gate = canonical.confidence_gate
+            dedup_copies += 1
+            bus.emit(stage, "equation_ok", equation_id=region.region_id, source="dedup_copy")
+
     duration_ms = round((time.perf_counter() - t0) * 1000, 2)
-    bus.emit(stage, "stage_end", rendered=rendered, cache_hits=cache_hits, failed=len(failed_list))
-    log.info("stage_end", rendered=rendered, cache_hits=cache_hits, failed=len(failed_list))
+    bus.emit(stage, "stage_end", rendered=rendered, cache_hits=cache_hits, failed=len(failed_list), dedup_copies=dedup_copies)
+    log.info("stage_end", rendered=rendered, cache_hits=cache_hits, failed=len(failed_list), dedup_copies=dedup_copies)
 
     rendered_list = [r for r in pass_list if r.svg is not None]
     return rendered_list, failed_list, StageResult(
@@ -271,5 +292,6 @@ def run(
             "rendered": rendered,
             "cache_hits": cache_hits,
             "failed": len(failed_list),
+            "dedup_copies": dedup_copies,
         },
     )
