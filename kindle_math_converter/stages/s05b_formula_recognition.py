@@ -301,6 +301,15 @@ def run(
                 )
                 recognized += 1
 
+            if (recognized + failed) % 25 == 0:
+                log.info(
+                    "pix2tex_progress",
+                    done=recognized + failed,
+                    total=len(image_regions),
+                    recognized=recognized,
+                    failed=failed,
+                )
+
     duration_ms = round((time.perf_counter() - t0) * 1000, 2)
     bus.emit(stage, "stage_end", recognized=recognized, failed=failed)
     log.info("stage_end", recognized=recognized, failed=failed)

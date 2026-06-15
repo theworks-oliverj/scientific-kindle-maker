@@ -195,7 +195,12 @@ def load_paddleocr_model() -> Any:
         from paddleocr import PaddleOCR  # type: ignore
 
         log.info("loading_paddleocr")
-        model = PaddleOCR(use_textline_orientation=True, lang="en")
+        model = PaddleOCR(
+            use_textline_orientation=True,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            lang="en",
+        )
         log.info("paddleocr_loaded")
         return model
     except Exception as exc:

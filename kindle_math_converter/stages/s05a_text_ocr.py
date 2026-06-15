@@ -48,6 +48,8 @@ def run(
         import numpy as np  # type: ignore
         from PIL import Image  # type: ignore
 
+        total_blocks = sum(len(page.text_blocks) for page in document.pages)
+
         for page in document.pages:
             for block in page.text_blocks:
                 # OCR the masked crop produced in Stage 3 (equation pixels already
@@ -67,10 +69,13 @@ def run(
                 text_parts = []
                 min_confidence = 1.0
 
-                for line in result[0]:
-                    # Result format: [bbox, (text, confidence)] — same in 2.x and 3.x
-                    rec = line[1]
-                    text, conf = (rec[0], rec[1]) if isinstance(rec, (list, tuple)) else (str(rec), 1.0)
+                # PaddleOCR 3.x .ocr() returns a list of dict-like OCRResult objects
+                # with "rec_texts" / "rec_scores" keys (not per-line [bbox, (text, conf)] tuples).
+                page_result = result[0]
+                rec_texts = page_result.get("rec_texts", [])
+                rec_scores = page_result.get("rec_scores", [])
+
+                for text, conf in zip(rec_texts, rec_scores):
                     text_parts.append(str(text))
                     if conf < min_confidence:
                         min_confidence = conf
@@ -89,6 +94,9 @@ def run(
 
                 block.raw_text = " ".join(text_parts)
                 blocks_processed += 1
+
+                if blocks_processed % 25 == 0:
+                    log.info("ocr_progress", blocks_done=blocks_processed, blocks_total=total_blocks)
 
         duration_ms = round((time.perf_counter() - t0) * 1000, 2)
         bus.emit(stage, "stage_end", blocks_processed=blocks_processed, low_confidence=low_confidence_count)
