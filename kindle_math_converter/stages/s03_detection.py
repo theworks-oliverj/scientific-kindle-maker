@@ -26,6 +26,15 @@ TEXT_DETECTION_CONFIDENCE_DEFAULT = 0.35
 # occupies < 20×20 px. Real inline equations are at least ~25px wide and ~12px tall.
 MIN_EQUATION_WIDTH_PX  = 20
 MIN_EQUATION_HEIGHT_PX = 12
+# Display formulas are rarely under 20px tall at 300dpi — a taller floor than
+# inline equations filters stray misclassified horizontal rules/underlines
+# without risking real small inline symbols (e.g. "B_1").
+MIN_EQUATION_HEIGHT_PX_DISPLAY = 20
+
+# Observability-only: a page producing more accepted equation regions than this
+# likely indicates over-detection (e.g. repeated single-symbol mentions). Never
+# drops content — just surfaces a warning + event for review.
+MAX_EQUATIONS_PER_PAGE_WARNING = 30
 
 # DocLayout-YOLO (DocStructBench) class names that carry readable body text.
 # Excludes: "abandon" (headers/footers/page numbers), "figure", "table",
@@ -196,6 +205,7 @@ def run(
                 continue
 
             eq_index = len(page.equation_regions)
+            eq_index_start = eq_index
             # Accepted equation pixel bboxes — used to mask math out of text crops below.
             equation_px_boxes: list[tuple[float, float, float, float]] = []
 
@@ -217,11 +227,23 @@ def run(
                         "height_px": round(px_y1 - px_y0, 1),
                     }
 
+                formula_class = (
+                    FormulaClass.DISPLAY
+                    if det.get("class_name", "").startswith("display")
+                    else FormulaClass.INLINE
+                )
+
                 # Size filter: reject detections too small to be a real equation
-                # (false positives: ©, ?, lone dash, apostrophe).
+                # (false positives: ©, ?, lone dash, apostrophe). Display formulas
+                # use a taller floor since they're rarely under 20px at 300dpi.
                 px_w = px_x1 - px_x0
                 px_h = px_y1 - px_y0
-                if px_w < MIN_EQUATION_WIDTH_PX or px_h < MIN_EQUATION_HEIGHT_PX:
+                min_height_px = (
+                    MIN_EQUATION_HEIGHT_PX_DISPLAY
+                    if formula_class == FormulaClass.DISPLAY
+                    else MIN_EQUATION_HEIGHT_PX
+                )
+                if px_w < MIN_EQUATION_WIDTH_PX or px_h < min_height_px:
                     bus.emit(
                         stage,
                         "equation_skipped",
@@ -239,12 +261,6 @@ def run(
                             f"det_{det_index}_too_small", px_x0, px_y0, px_x1, px_y1,
                         )
                     continue
-
-                formula_class = (
-                    FormulaClass.DISPLAY
-                    if det.get("class_name", "").startswith("display")
-                    else FormulaClass.INLINE
-                )
 
                 crop_bytes = _crop_image(pil_img, px_x0, px_y0, px_x1, px_y1)
                 equation_px_boxes.append((px_x0, px_y0, px_x1, px_y1))
@@ -294,6 +310,20 @@ def run(
                     confidence=det["confidence"],
                 )
 
+            page_equation_count = len(page.equation_regions) - eq_index_start
+            if page_equation_count > MAX_EQUATIONS_PER_PAGE_WARNING:
+                warnings.append(
+                    f"Page {page.page_number} produced {page_equation_count} equation "
+                    f"regions (> {MAX_EQUATIONS_PER_PAGE_WARNING}) — possible over-detection."
+                )
+                bus.emit(
+                    stage,
+                    "page_equation_overload",
+                    page=page.page_number,
+                    equation_count=page_equation_count,
+                    threshold=MAX_EQUATIONS_PER_PAGE_WARNING,
+                )
+
             # ── Body-text region detection (DocLayout-YOLO) ──────────────────
             # Populates page.text_blocks with equation pixels masked out, so the
             # OCR stage (s05a) never sees garbled inline math. Skipped silently if
@@ -305,6 +335,8 @@ def run(
                     warnings.append(f"Page {page.page_number} layout detection failed: {exc}")
                     log.warning("layout_detection_failed", page=page.page_number, error=str(exc))
                     text_dets = []
+
+                text_dets = _dedup_overlapping_text_detections(text_dets)
 
                 tb_index = len(page.text_blocks)
                 for det in text_dets:
@@ -405,6 +437,40 @@ def _run_formula_detection(formula_model, pil_img) -> list[dict]:
                 "class_name": class_name,
             })
     return detections
+
+
+def _bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    intersection = iw * ih
+    if intersection <= 0:
+        return 0.0
+    area_a = (ax1 - ax0) * (ay1 - ay0)
+    area_b = (bx1 - bx0) * (by1 - by0)
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _dedup_overlapping_text_detections(
+    detections: list[dict], iou_threshold: float = 0.7,
+) -> list[dict]:
+    """
+    DocLayout-YOLO can fire multiple overlapping classes (e.g. "plain text" and
+    "figure_caption") on the same physical text block, which would otherwise be
+    OCR'd and emitted twice — producing verbatim-duplicated paragraphs in the
+    EPUB. Keep only the highest-confidence detection among any group of
+    detections whose bboxes overlap by more than `iou_threshold`.
+    """
+    ordered = sorted(detections, key=lambda d: d["confidence"], reverse=True)
+    kept: list[dict] = []
+    for det in ordered:
+        if any(_bbox_iou(det["bbox"], k["bbox"]) > iou_threshold for k in kept):
+            continue
+        kept.append(det)
+    return kept
 
 
 def _run_layout_detection(layout_model, pil_img) -> list[dict]:
