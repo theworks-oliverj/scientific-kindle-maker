@@ -59,6 +59,8 @@ BOOK_CSS = """\
 .eq-text { white-space: nowrap; }
 .eq-img-fallback { max-width: 100%; }
 span.eq-inline img.eq-img-fallback { height: 1.2em; width: auto; vertical-align: middle; }
+.figure { text-align: center; margin: 1em 0; }
+.figure img { max-width: 100%; }
 """
 
 XHTML_TEMPLATE = """\
@@ -177,6 +179,17 @@ def _page_to_xhtml(
             _substitute_placeholder, _escape_text(block.raw_text)
         )
         all_items.append((order, block.bbox.y0, _EMPTY_P_RE.sub("", f"<p>{text_html}</p>")))
+
+    for figure in page.figures:
+        if not figure.image_bytes:
+            continue
+        if fallback_images is not None:
+            fallback_images[figure.figure_id] = figure.image_bytes
+        fig_html = (
+            f'<div class="figure"><img alt="{_escape_text(figure.alt_text)}" '
+            f'src="../images/{figure.figure_id}.png"/></div>'
+        )
+        all_items.append((figure.reading_order_index, figure.bbox.y0, fig_html))
 
     for region in page.equation_regions:
         if region.region_id in consumed:

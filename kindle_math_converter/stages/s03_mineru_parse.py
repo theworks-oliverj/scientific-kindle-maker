@@ -41,7 +41,7 @@ from ..equation_filters import (
     normalize_for_dedup,
     simple_text_repr,
 )
-from ..models.document import BoundingBox, Document, EquationRegion, Page, TextBlock
+from ..models.document import BoundingBox, Document, EquationRegion, FigureBlock, Page, TextBlock
 from ..models.enums import FormulaClass
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
@@ -204,7 +204,7 @@ def run(
     n_display = 0
     n_inline = 0
     n_rendered_as_text = 0
-    n_media_skipped = 0
+    n_figures = 0
 
     for page_info in pdf_info:
         page_idx = page_info.get("page_idx", 0)
@@ -215,50 +215,10 @@ def run(
         page_img, sx, sy = _page_image_and_scale(page, page_info.get("page_size", [612, 792]))
         eq_counter = 0
 
-        for block in page_info.get("para_blocks", []):
-            btype = block.get("type", "text")
-            block_order = block.get("index", block.get("bbox", [0, 0, 0, 0])[1])
-            bbox_pts = block.get("bbox", [0, 0, 0, 0])
-
-            if btype == _EQUATION_BLOCK_TYPE:
-                spans = [
-                    s
-                    for line in _iter_lines(block)
-                    for s in line.get("spans", [])
-                    if s.get("type") == _EQUATION_BLOCK_TYPE and s.get("content")
-                ]
-                if not spans:
-                    warnings.append(f"empty interline_equation block on page {page_number}")
-                    continue
-                for span in spans:
-                    eq_counter += 1
-                    latex, number = extract_equation_tag(span["content"])
-                    region = EquationRegion(
-                        region_id=f"eq_{page_number}_{eq_counter}",
-                        bbox=_pixel_bbox(span.get("bbox", bbox_pts), sx, sy, page_number),
-                        formula_class=FormulaClass.DISPLAY,
-                        source_image_crop=(
-                            _crop_png(page_img, span.get("bbox", bbox_pts), sx, sy)
-                            if page_img else None
-                        ),
-                        raw_latex=latex,
-                        normalized_latex=None, cdm_score=None, confidence_gate=None,
-                        svg=None, svg_postprocessed=None,
-                        equation_number=number,
-                        reading_order_index=block_order,
-                    )
-                    page.equation_regions.append(region)
-                    n_display += 1
-                    bus.emit(STAGE, "equation_ok", equation_id=region.region_id, raw_latex=latex)
-                continue
-
-            if btype in _MEDIA_BLOCK_TYPES:
-                # Figures/tables are not embedded yet; captions still carry
-                # useful text, so fall through and harvest text spans only.
-                n_media_skipped += 1
-                bus.emit(STAGE, "media_block_skipped", block_type=btype, page=page_number)
-
-            # Text-like block (text, title, list, ref_text, captions, unknown)
+        def harvest_text_block(block: dict, block_order, bbox_pts: list) -> None:
+            """Walks a text-like block's spans into a TextBlock, creating
+            inline/display EquationRegions with placeholders as it goes."""
+            nonlocal eq_counter, n_text_blocks, n_display, n_inline, n_rendered_as_text
             parts: list[str] = []
             for line in _iter_lines(block):
                 for span in line.get("spans", []):
@@ -319,7 +279,7 @@ def run(
 
             raw_text = " ".join(parts).strip()
             if not raw_text:
-                continue
+                return
             page.text_blocks.append(
                 TextBlock(
                     block_id=f"tb_{page_number}_{len(page.text_blocks) + 1}",
@@ -329,6 +289,86 @@ def run(
                 )
             )
             n_text_blocks += 1
+
+        for block in page_info.get("para_blocks", []):
+            btype = block.get("type", "text")
+            block_order = block.get("index", block.get("bbox", [0, 0, 0, 0])[1])
+            bbox_pts = block.get("bbox", [0, 0, 0, 0])
+
+            if btype == _EQUATION_BLOCK_TYPE:
+                spans = [
+                    s
+                    for line in _iter_lines(block)
+                    for s in line.get("spans", [])
+                    if s.get("type") == _EQUATION_BLOCK_TYPE and s.get("content")
+                ]
+                if not spans:
+                    warnings.append(f"empty interline_equation block on page {page_number}")
+                    continue
+                for span in spans:
+                    eq_counter += 1
+                    latex, number = extract_equation_tag(span["content"])
+                    region = EquationRegion(
+                        region_id=f"eq_{page_number}_{eq_counter}",
+                        bbox=_pixel_bbox(span.get("bbox", bbox_pts), sx, sy, page_number),
+                        formula_class=FormulaClass.DISPLAY,
+                        source_image_crop=(
+                            _crop_png(page_img, span.get("bbox", bbox_pts), sx, sy)
+                            if page_img else None
+                        ),
+                        raw_latex=latex,
+                        normalized_latex=None, cdm_score=None, confidence_gate=None,
+                        svg=None, svg_postprocessed=None,
+                        equation_number=number,
+                        reading_order_index=block_order,
+                    )
+                    page.equation_regions.append(region)
+                    n_display += 1
+                    bus.emit(STAGE, "equation_ok", equation_id=region.region_id, raw_latex=latex)
+                continue
+
+            if btype in _MEDIA_BLOCK_TYPES:
+                # Figure/table: embed the *_body sub-block as a raster crop
+                # (its span "content" is MinerU's VLM description — used as
+                # alt text, never as page text, since it may also contain
+                # stray labels OCR'd from inside the drawing). Caption and
+                # footnote sub-blocks are harvested as normal text.
+                body_bbox: Optional[list] = None
+                alt_text = ""
+                for sub in block.get("blocks", []):
+                    sub_type = sub.get("type", "")
+                    if sub_type.endswith("_body"):
+                        body_bbox = sub.get("bbox", bbox_pts)
+                        alt_text = " ".join(
+                            " ".join((s.get("content") or "").split())
+                            for line in sub.get("lines", [])
+                            for s in line.get("spans", [])
+                        ).strip()
+                    else:
+                        harvest_text_block(sub, block_order, sub.get("bbox", bbox_pts))
+
+                fig_bytes = (
+                    _crop_png(page_img, body_bbox or bbox_pts, sx, sy)
+                    if page_img else None
+                )
+                figure = FigureBlock(
+                    figure_id=f"fig_{page_number}_{len(page.figures) + 1}",
+                    bbox=_pixel_bbox(body_bbox or bbox_pts, sx, sy, page_number),
+                    image_bytes=fig_bytes,
+                    alt_text=alt_text or f"{btype} on page {page_number}",
+                    reading_order_index=block_order,
+                )
+                page.figures.append(figure)
+                n_figures += 1
+                bus.emit(
+                    STAGE, "figure_embedded",
+                    figure_id=figure.figure_id, block_type=btype,
+                    has_image=fig_bytes is not None,
+                )
+                continue
+
+            # Text-like block (text, title, list, ref_text, unknown)
+            harvest_text_block(block, block_order, bbox_pts)
 
         if page_img is not None:
             page_img.close()
@@ -360,7 +400,7 @@ def run(
         "inline_equations": n_inline,
         "rendered_as_text": n_rendered_as_text,
         "deduped": n_deduped,
-        "media_blocks_skipped": n_media_skipped,
+        "figures_embedded": n_figures,
     }
     bus.emit(STAGE, "stage_end", equation_id=None, **metrics)
     log.info("stage_end", **metrics)

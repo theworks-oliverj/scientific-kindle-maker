@@ -81,6 +81,17 @@ class TextBlock:
 
 
 @dataclass
+class FigureBlock:
+    """A figure/table region embedded as a raster image (crop from the page
+    raster). Captions are separate TextBlocks — this is just the graphic."""
+    figure_id: str                 # "fig_{page}_{index}"
+    bbox: BoundingBox
+    image_bytes: Optional[bytes]   # PNG crop of the figure body
+    alt_text: str                  # MinerU's VLM description of the image
+    reading_order_index: int
+
+
+@dataclass
 class Page:
     page_number: int               # 1-indexed
     width_pt: float
@@ -89,6 +100,7 @@ class Page:
     image_bytes: Optional[bytes]   # Set in Stage 2B for visual PDFs
     text_blocks: list[TextBlock] = field(default_factory=list)
     equation_regions: list[EquationRegion] = field(default_factory=list)
+    figures: list[FigureBlock] = field(default_factory=list)
 
 
 @dataclass
