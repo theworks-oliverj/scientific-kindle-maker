@@ -15,13 +15,14 @@ import time
 from pathlib import Path
 
 from ..cache.equation_cache import SessionEquationCache
+from ..concurrency import parallel_for_each
 from ..models.document import Document, EquationRegion, FailureReason
 from ..models.enums import ConfidenceGate, ErrorCode, FormulaClass
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
 from ..observability.logger import get_logger
 # Reuse the dynamic wrapper builder so package sets stay in sync with Stage 6
-from .s06_validation import _build_latex_wrapper
+from .s06_validation import _build_latex_wrapper, warm_up_tectonic
 
 log = get_logger("s08a_svg_render")
 
@@ -163,6 +164,87 @@ def xdv_to_svg(xdv_path: Path, work_dir: Path, timeout: int = 10) -> str:
     return svg_path.read_text(encoding="utf-8")
 
 
+def _render_region(
+    region: EquationRegion,
+    latex: str,
+    cache: SessionEquationCache,
+    tectonic_timeout: int,
+    dvisvgm_timeout: int,
+    stage: str,
+) -> dict:
+    """
+    Renders a single equation region via tectonic + dvisvgm, mutating it in
+    place (svg, confidence_gate, error_codes, failure_reason on failure).
+
+    Returns a result record for sequential aggregation by the caller —
+    `rendered` (bool), an optional `warning` string, and an `event`
+    (event_type, payload) for `bus.emit`. Each region/latex pair is
+    independent (own temp dir, own subprocess calls), so this is safe to
+    call from a thread pool; `cache.put` is internally locked.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work = Path(tmpdir)
+            xdv_path = latex_to_xdv(latex, region.formula_class, work, tectonic_timeout)
+            svg = xdv_to_svg(xdv_path, work, dvisvgm_timeout)
+
+        region.svg = svg
+        cache.put(latex, svg, region.cdm_score or 0.0)
+        return {
+            "rendered": True,
+            "warning": None,
+            "event": ("equation_ok", {"equation_id": region.region_id}),
+        }
+
+    except subprocess.TimeoutExpired:
+        region.confidence_gate = ConfidenceGate.FALLBACK
+        region.error_codes.append(ErrorCode.TECTONIC_FAILED.value)
+        region.failure_reason = FailureReason(
+            code=ErrorCode.TECTONIC_FAILED.value,
+            sub_code=ErrorCode.TECTONIC_FAILED.value,
+            stage=stage,
+            detail="tectonic timed out during SVG render",
+            recoverable=False,
+        )
+        return {
+            "rendered": False,
+            "warning": f"{region.region_id}: tectonic timeout",
+            "event": ("equation_error", {"equation_id": region.region_id, "error": "timeout"}),
+        }
+
+    except LatexCompileError as exc:
+        region.confidence_gate = ConfidenceGate.FALLBACK
+        region.error_codes.append(ErrorCode.TECTONIC_FAILED.value)
+        region.failure_reason = FailureReason(
+            code=ErrorCode.TECTONIC_FAILED.value,
+            sub_code=ErrorCode.TECTONIC_FAILED.value,
+            stage=stage,
+            detail=f"tectonic compile error: {str(exc)[:120]}",
+            recoverable=False,
+        )
+        return {
+            "rendered": False,
+            "warning": f"{region.region_id}: compile failed — {exc}",
+            "event": ("equation_error", {"equation_id": region.region_id, "error": str(exc)}),
+        }
+
+    except (SVGRenderError, FileNotFoundError) as exc:
+        region.confidence_gate = ConfidenceGate.FALLBACK
+        region.error_codes.append(ErrorCode.DVISVGM_FAILED.value)
+        region.failure_reason = FailureReason(
+            code=ErrorCode.DVISVGM_FAILED.value,
+            sub_code=ErrorCode.DVISVGM_FAILED.value,
+            stage=stage,
+            detail=f"dvisvgm error: {str(exc)[:120]}",
+            recoverable=False,
+        )
+        return {
+            "rendered": False,
+            "warning": f"{region.region_id}: dvisvgm failed — {exc}",
+            "event": ("equation_error", {"equation_id": region.region_id, "error": str(exc)}),
+        }
+
+
 def run(
     pass_list: list[EquationRegion],
     cache: SessionEquationCache,
@@ -170,6 +252,7 @@ def run(
     document: Document | None = None,
     tectonic_timeout: int = 15,
     dvisvgm_timeout: int = 10,
+    max_parallel_workers: int | None = None,
 ) -> tuple[list[EquationRegion], list[EquationRegion], StageResult]:
     """
     Returns (rendered_list, failed_list, stage_result).
@@ -186,6 +269,10 @@ def run(
     bus.emit(stage, "stage_start", equations=len(pass_list))
     log.info("stage_start", equations=len(pass_list))
 
+    # ── Pass 1 (sequential, cheap): resolve no-latex/cache-hit regions ──────
+    # Only regions that actually need a tectonic/dvisvgm subprocess call are
+    # handed to the thread pool.
+    to_render: list[tuple[EquationRegion, str]] = []
     for region in pass_list:
         latex = region.normalized_latex or region.raw_latex or ""
         if not latex:
@@ -203,59 +290,48 @@ def run(
             rendered += 1
             continue
 
-        # Render via tectonic (XDV) + dvisvgm
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                work = Path(tmpdir)
-                xdv_path = latex_to_xdv(latex, region.formula_class, work, tectonic_timeout)
-                svg = xdv_to_svg(xdv_path, work, dvisvgm_timeout)
+        to_render.append((region, latex))
 
-            region.svg = svg
-            cache.put(latex, svg, region.cdm_score or 0.0)
+    # ── Pass 2 (parallel): tectonic + dvisvgm for cache misses ──────────────
+    if to_render:
+        warm_up_tectonic()
+
+    results = parallel_for_each(
+        to_render,
+        lambda item: _render_region(item[0], item[1], cache, tectonic_timeout, dvisvgm_timeout, stage),
+        max_workers=max_parallel_workers,
+    )
+
+    # ── Pass 3 (sequential retry): parallel-pass failures get one calm,
+    # uncontended attempt. Transient tectonic timeouts under an 8-way thread
+    # pool (bundle-cache and CPU contention) are common enough that retrying
+    # alone recovers most of them; a genuine compile error fails again fast.
+    retry_failed = 0
+    for (region, latex), result in zip(to_render, results):
+        if not result["rendered"]:
+            retry = _render_region(region, latex, cache, tectonic_timeout, dvisvgm_timeout, stage)
+            if retry["rendered"]:
+                region.confidence_gate = ConfidenceGate.PASS
+                region.failure_reason = None
+                region.error_codes = [
+                    c for c in region.error_codes
+                    if c not in (ErrorCode.TECTONIC_FAILED.value, ErrorCode.DVISVGM_FAILED.value)
+                ]
+                bus.emit(stage, "render_retry_ok", equation_id=region.region_id)
+                result.update(retry)
+            else:
+                retry_failed += 1
+                result.update(retry)
+
+    for (region, _latex), result in zip(to_render, results):
+        if result["rendered"]:
             rendered += 1
-            bus.emit(stage, "equation_ok", equation_id=region.region_id)
-
-        except subprocess.TimeoutExpired:
-            region.confidence_gate = ConfidenceGate.FALLBACK
-            region.error_codes.append(ErrorCode.TECTONIC_FAILED.value)
-            region.failure_reason = FailureReason(
-                code=ErrorCode.TECTONIC_FAILED.value,
-                sub_code=ErrorCode.TECTONIC_FAILED.value,
-                stage=stage,
-                detail="tectonic timed out during SVG render",
-                recoverable=False,
-            )
+        else:
             failed_list.append(region)
-            warnings.append(f"{region.region_id}: tectonic timeout")
-            bus.emit(stage, "equation_error", equation_id=region.region_id, error="timeout")
-
-        except LatexCompileError as exc:
-            region.confidence_gate = ConfidenceGate.FALLBACK
-            region.error_codes.append(ErrorCode.TECTONIC_FAILED.value)
-            region.failure_reason = FailureReason(
-                code=ErrorCode.TECTONIC_FAILED.value,
-                sub_code=ErrorCode.TECTONIC_FAILED.value,
-                stage=stage,
-                detail=f"tectonic compile error: {str(exc)[:120]}",
-                recoverable=False,
-            )
-            failed_list.append(region)
-            warnings.append(f"{region.region_id}: compile failed — {exc}")
-            bus.emit(stage, "equation_error", equation_id=region.region_id, error=str(exc))
-
-        except (SVGRenderError, FileNotFoundError) as exc:
-            region.confidence_gate = ConfidenceGate.FALLBACK
-            region.error_codes.append(ErrorCode.DVISVGM_FAILED.value)
-            region.failure_reason = FailureReason(
-                code=ErrorCode.DVISVGM_FAILED.value,
-                sub_code=ErrorCode.DVISVGM_FAILED.value,
-                stage=stage,
-                detail=f"dvisvgm error: {str(exc)[:120]}",
-                recoverable=False,
-            )
-            failed_list.append(region)
-            warnings.append(f"{region.region_id}: dvisvgm failed — {exc}")
-            bus.emit(stage, "equation_error", equation_id=region.region_id, error=str(exc))
+        if result["warning"]:
+            warnings.append(result["warning"])
+        event_type, payload = result["event"]
+        bus.emit(stage, event_type, **payload)
 
     # ── Stage 1.3: copy the canonical's raw SVG to its dedup duplicates ────
     # Duplicates never appear in pass_list (filtered out in Stage 7), so they

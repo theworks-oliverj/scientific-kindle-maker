@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Optional, Any
 
 from .cache.equation_cache import SessionEquationCache
-from .model_manager import load_all_models, get_models_dir
 from .models.document import Document
 from .models.enums import SourceType
 from .models.results import PipelineResult, StageResult
@@ -22,10 +21,8 @@ from .stages import (
     s02a_digital_pdf,
     s02b_visual,
     s02c_epub,
-    s03_detection,
-    s04_reading_order,
-    s05a_text_ocr,
-    s05b_formula_recognition,
+    s03_mineru_parse,
+    s05c_mathml,
     s06_validation,
     s07_routing,
     s08a_svg_render,
@@ -49,11 +46,13 @@ class PipelineConfig:
     cdm_repair_threshold: float = 0.70
     # Rendering
     body_font_size_pt: float = 10.0
-    tectonic_timeout_s: int = 15
+    tectonic_timeout_s: int = 45
     dvisvgm_timeout_s: int = 10
     max_repair_attempts: int = 2
-    # Detection
-    formula_detection_confidence: float = 0.35
+    # MinerU (replaces old s03–s05b for PDF sources)
+    mineru_backend: str = "vlm-engine"
+    mineru_timeout_s: int = 3600
+    mineru_reuse_existing: bool = True
     # Fallback
     mathpix_app_id: Optional[str] = None
     mathpix_app_key: Optional[str] = None
@@ -66,9 +65,8 @@ class PipelineConfig:
     epubcheck_enabled: bool = True
     # Cache dump
     dump_cache: bool = False
-    # Debug dump (Stage 3/5B detection & recognition audit trail)
-    s03_debug_dump_enabled: bool = False
-    s03_debug_dump_dir: Optional[str] = None
+    # Parallelism (Stage 6/8A per-equation work — None = concurrency.py default)
+    max_parallel_workers: Optional[int] = None
 
 
 class Pipeline:
@@ -76,8 +74,6 @@ class Pipeline:
         self.config = config
         self.bus = EventBus()
         self.cache = SessionEquationCache()
-        # load_all_models handles downloading on first run via model_manager.py
-        self.models = load_all_models(get_models_dir())
 
     def run(self, input_path: str, output_dir: str) -> PipelineResult:
         result = PipelineResult(
@@ -138,10 +134,6 @@ class Pipeline:
         cfg = self.config
         out_dir = Path(output_dir)
 
-        debug_dump_dir: Optional[str] = None
-        if cfg.s03_debug_dump_enabled:
-            debug_dump_dir = cfg.s03_debug_dump_dir or str(out_dir / "debug_crops")
-
         # Stage 1: Input classification (fatal on failure)
         metadata, sr1 = s01_classifier.run(input_path, self.bus)
         result.stage_results.append(sr1)
@@ -161,36 +153,25 @@ class Pipeline:
         if not sr2.ok:
             raise FatalPipelineError(f"Stage 2 failed: {sr2.errors}")
 
-        # Stage 3: Layout and formula detection (fatal on failure)
-        if source_type not in (SourceType.EPUB, SourceType.HTML):
-            model_bundle = s03_detection.ModelBundle(
-                layout_model=self.models.get("layout"),
-                formula_model=self.models.get("formula"),
-            )
-            document, sr3 = s03_detection.run(
+        # Stage 3 (MinerU): layout + reading order + text OCR + formula
+        # recognition in one subprocess pass (fatal on failure). EPUB/HTML
+        # sources skip MinerU — s02c already extracted text and MathML.
+        if source_type in (SourceType.EPUB, SourceType.HTML):
+            document, sr5c = s05c_mathml.run(document, self.bus)
+            result.stage_results.append(sr5c)
+        else:
+            document, sr3 = s03_mineru_parse.run(
                 document,
-                model_bundle,
                 self.bus,
-                formula_confidence_threshold=cfg.formula_detection_confidence,
-                debug_dump_dir=debug_dump_dir,
+                source_pdf=input_path,
+                work_dir=out_dir / "mineru",
+                backend=cfg.mineru_backend,
+                timeout_s=cfg.mineru_timeout_s,
+                reuse_existing=cfg.mineru_reuse_existing,
             )
             result.stage_results.append(sr3)
             if not sr3.ok:
-                raise FatalPipelineError(f"Stage 3 failed: {sr3.errors}")
-
-        # Stage 4: Reading order (non-fatal — continue on warning)
-        document, sr4 = s04_reading_order.run(document, self.bus)
-        result.stage_results.append(sr4)
-
-        # Stage 5A: Text OCR (non-fatal)
-        document, sr5a = s05a_text_ocr.run(document, self.models.get("paddleocr"), self.bus)
-        result.stage_results.append(sr5a)
-
-        # Stage 5B: Formula recognition (non-fatal per equation)
-        document, sr5b = s05b_formula_recognition.run(
-            document, self.models.get("pix2tex"), self.bus, debug_dump_dir=debug_dump_dir,
-        )
-        result.stage_results.append(sr5b)
+                raise FatalPipelineError(f"Stage 3 (MinerU) failed: {sr3.errors}")
 
         # Stage 6: LaTeX validation and repair (non-fatal per equation)
         document, sr6 = s06_validation.run(
@@ -200,6 +181,7 @@ class Pipeline:
             cdm_repair_threshold=cfg.cdm_repair_threshold,
             max_repair_attempts=cfg.max_repair_attempts,
             cdm_method=cfg.cdm_method,
+            max_parallel_workers=cfg.max_parallel_workers,
         )
         result.stage_results.append(sr6)
 
@@ -215,6 +197,7 @@ class Pipeline:
             document=document,
             tectonic_timeout=cfg.tectonic_timeout_s,
             dvisvgm_timeout=cfg.dvisvgm_timeout_s,
+            max_parallel_workers=cfg.max_parallel_workers,
         )
         result.stage_results.append(sr8a)
 

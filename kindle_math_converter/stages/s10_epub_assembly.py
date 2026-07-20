@@ -5,6 +5,7 @@ SVGs are inlined directly in XHTML — never as <object> tags (KindleGen rejects
 Runs epubcheck validation after assembly.
 Failure mode: Fatal.
 """
+import re
 import subprocess
 import time
 import uuid
@@ -56,6 +57,8 @@ BOOK_CSS = """\
 .eq-display svg { max-width: 100%; }
 .eq-flagged { color: #cc0000; font-family: monospace; border: 1px solid #cc0000; padding: 0 4px; }
 .eq-text { white-space: nowrap; }
+.eq-img-fallback { max-width: 100%; }
+span.eq-inline img.eq-img-fallback { height: 1.2em; width: auto; vertical-align: middle; }
 """
 
 XHTML_TEMPLATE = """\
@@ -74,13 +77,20 @@ XHTML_TEMPLATE = """\
 """
 
 
-def _render_equation(region: EquationRegion) -> Optional[str]:
+def _render_equation(
+    region: EquationRegion,
+    fallback_images: Optional[dict[str, bytes]] = None,
+) -> Optional[str]:
     """
     Returns the HTML snippet for one equation region, or None if the region
     should be omitted from the page entirely (reference/footnote labels
     already present in the surrounding body text, and irrecoverably flagged
-    equations — neither should leak a raw [EQ:...] placeholder into the
-    reading flow).
+    equations with no crop to fall back on — neither should leak a raw
+    [EQ:...] placeholder into the reading flow).
+
+    Flagged/unrendered equations with a source crop are embedded as a raster
+    <img> (registered in `fallback_images` for the assembler to write into
+    the EPUB) — for a reading tool, a raster equation beats a missing one.
     """
     if region.render_as_text:
         return f'<span class="eq-text">{region.inline_text_repr}</span>'
@@ -89,6 +99,19 @@ def _render_equation(region: EquationRegion) -> Optional[str]:
         return None
 
     if region.flagged_for_review or not region.svg_postprocessed:
+        if fallback_images is not None and region.source_image_crop:
+            fallback_images[region.region_id] = region.source_image_crop
+            img = (
+                f'<img class="eq-img-fallback" alt="equation {region.region_id}" '
+                f'src="../images/{region.region_id}.png"/>'
+            )
+            if region.formula_class == FormulaClass.INLINE:
+                return f'<span class="eq-inline">{img}</span>'
+            number_html = (
+                f'<span class="eq-number">{region.equation_number}</span>'
+                if region.equation_number else ""
+            )
+            return f'<div class="eq-display">{img}{number_html}</div>'
         return None
 
     svg = region.svg_postprocessed
@@ -102,25 +125,63 @@ def _render_equation(region: EquationRegion) -> Optional[str]:
         return f'<div class="eq-display">{svg}{number_html}</div>'
 
 
-def _page_to_xhtml(page: Page, title: str, bus: EventBus) -> str:
+# Inline-equation placeholder embedded in TextBlock.raw_text by
+# s03_mineru_parse (uses only characters that survive _escape_text).
+_EQ_PLACEHOLDER_RE = re.compile(r'\[\[EQ:([A-Za-z0-9_]+)\]\]')
+_EMPTY_P_RE = re.compile(r'<p>\s*</p>')
+
+
+def _page_to_xhtml(
+    page: Page,
+    title: str,
+    bus: EventBus,
+    fallback_images: Optional[dict[str, bytes]] = None,
+) -> str:
     """Converts a page's text blocks and equations into XHTML body content."""
     # Build a combined reading-order list of text and equations
     # For pages from PDF/scanned sources, interleave text and equations by y-position
 
     body_parts = []
 
-    # Order content by the unified reading_order_index assigned in Stage 4
-    # (column-aware). Fall back to vertical position when the index is absent.
+    # Order content by the unified reading_order_index. Fall back to vertical
+    # position when the index is absent.
     all_items: list[tuple[float, float, str]] = []
+
+    regions_by_id = {r.region_id: r for r in page.equation_regions}
+    consumed: set[str] = set()
+
+    def _substitute_placeholder(match: "re.Match[str]") -> str:
+        region_id = match.group(1)
+        region = regions_by_id.get(region_id)
+        consumed.add(region_id)
+        if region is None:
+            return ""
+        html = _render_equation(region, fallback_images)
+        if html is None:
+            if region.flagged_for_review and not region.is_reference_label:
+                bus.emit(
+                    "s10_epub_assembly", "equation_skipped",
+                    equation_id=region.region_id, reason="flagged_no_render",
+                )
+            return ""
+        if region.formula_class == FormulaClass.DISPLAY:
+            # A block element cannot nest inside <p>: split the paragraph.
+            return f"</p>{html}<p>"
+        return html
 
     for block in page.text_blocks:
         if not block.raw_text.strip():
             continue  # skip blocks where OCR produced nothing
         order = block.reading_order_index if block.reading_order_index is not None else block.bbox.y0
-        all_items.append((order, block.bbox.y0, f"<p>{_escape_text(block.raw_text)}</p>"))
+        text_html = _EQ_PLACEHOLDER_RE.sub(
+            _substitute_placeholder, _escape_text(block.raw_text)
+        )
+        all_items.append((order, block.bbox.y0, _EMPTY_P_RE.sub("", f"<p>{text_html}</p>")))
 
     for region in page.equation_regions:
-        html = _render_equation(region)
+        if region.region_id in consumed:
+            continue  # rendered inline within its paragraph
+        html = _render_equation(region, fallback_images)
         if html is None:
             if region.flagged_for_review and not region.is_reference_label:
                 bus.emit(
@@ -150,12 +211,26 @@ def _escape_text(text: str) -> str:
     )
 
 
-def _build_opf(title: str, author: str, uid: str, chapters: list[str]) -> str:
+def _build_opf(
+    title: str,
+    author: str,
+    uid: str,
+    chapters: list[str],
+    image_ids: Optional[list[str]] = None,
+) -> str:
     items = "\n    ".join(
         f'<item id="chapter{i+1}" href="content/chapter_{i+1:03d}.xhtml" '
-        f'media-type="application/xhtml+xml"/>'
-        for i in range(len(chapters))
+        f'media-type="application/xhtml+xml"'
+        # epubcheck OPF-014: items with embedded SVG must declare it
+        + (' properties="svg"' if "<svg" in chapter else "")
+        + "/>"
+        for i, chapter in enumerate(chapters)
     )
+    if image_ids:
+        items += "\n    " + "\n    ".join(
+            f'<item id="img_{img_id}" href="images/{img_id}.png" media-type="image/png"/>'
+            for img_id in image_ids
+        )
     itemrefs = "\n    ".join(
         f'<itemref idref="chapter{i+1}"/>'
         for i in range(len(chapters))
@@ -235,27 +310,35 @@ def _iso_now() -> str:
 
 def _run_epubcheck(epub_path: Path, bus: EventBus) -> list[str]:
     """Runs epubcheck. Returns list of error strings. Warnings are ignored."""
-    # Find epubcheck jar
     import shutil
-    java = shutil.which("java")
-    if not java:
-        log.warning("epubcheck_skipped", reason="java_not_found")
-        return []
 
-    # Common epubcheck locations
-    epubcheck_paths = [
-        Path.home() / ".local" / "lib" / "epubcheck" / "epubcheck.jar",
-        Path("/usr/local/lib/epubcheck/epubcheck.jar"),
-        Path("/opt/epubcheck/epubcheck.jar"),
-    ]
-    jar = next((p for p in epubcheck_paths if p.exists()), None)
-    if not jar:
-        log.warning("epubcheck_skipped", reason="jar_not_found")
-        return []
+    # Prefer an epubcheck wrapper script on PATH (e.g. Homebrew's, which
+    # bundles its own JAVA_HOME and works without a system JRE).
+    cmd: list[str] | None = None
+    wrapper = shutil.which("epubcheck")
+    if wrapper:
+        cmd = [wrapper, str(epub_path)]
+    else:
+        java = shutil.which("java")
+        if not java:
+            log.warning("epubcheck_skipped", reason="java_not_found")
+            return []
+
+        # Common epubcheck locations
+        epubcheck_paths = [
+            Path.home() / ".local" / "lib" / "epubcheck" / "epubcheck.jar",
+            Path("/usr/local/lib/epubcheck/epubcheck.jar"),
+            Path("/opt/epubcheck/epubcheck.jar"),
+        ]
+        jar = next((p for p in epubcheck_paths if p.exists()), None)
+        if not jar:
+            log.warning("epubcheck_skipped", reason="jar_not_found")
+            return []
+        cmd = [java, "-jar", str(jar), str(epub_path)]
 
     try:
         result = subprocess.run(
-            [java, "-jar", str(jar), str(epub_path)],
+            cmd,
             capture_output=True,
             timeout=60,
         )
@@ -296,9 +379,11 @@ def run(
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Generate XHTML for each page/chapter
+        # Generate XHTML for each page/chapter. Flagged equations with a
+        # source crop are embedded as raster images collected here.
+        fallback_images: dict[str, bytes] = {}
         chapters_xhtml = [
-            _page_to_xhtml(page, title, bus)
+            _page_to_xhtml(page, title, bus, fallback_images)
             for page in document.pages
         ]
 
@@ -328,12 +413,19 @@ def run(
             for i, xhtml in enumerate(chapters_xhtml):
                 zf.writestr(f"OEBPS/content/chapter_{i+1:03d}.xhtml", xhtml)
 
+            # Raster fallbacks for flagged equations
+            for img_id, png_bytes in fallback_images.items():
+                zf.writestr(f"OEBPS/images/{img_id}.png", png_bytes)
+
             # Navigation
             zf.writestr("OEBPS/nav.xhtml", _build_nav(title, chapters_xhtml))
             zf.writestr("OEBPS/toc.ncx", _build_ncx(title, uid, chapters_xhtml))
 
             # Package document
-            zf.writestr("OEBPS/content.opf", _build_opf(title, author, uid, chapters_xhtml))
+            zf.writestr(
+                "OEBPS/content.opf",
+                _build_opf(title, author, uid, chapters_xhtml, sorted(fallback_images)),
+            )
 
         # Run epubcheck
         if epubcheck_enabled:

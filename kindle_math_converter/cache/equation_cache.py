@@ -1,5 +1,6 @@
 import hashlib
 import re
+import threading
 from dataclasses import dataclass
 
 
@@ -63,15 +64,20 @@ class SessionEquationCache:
         self._store: dict[str, CachedRender] = {}
         self._hits: int = 0
         self._misses: int = 0
+        # Phase 2: s08a_svg_render processes equations in a thread pool, and
+        # multiple workers may hit get()/put() concurrently for distinct
+        # equations that normalize to the same LaTeX.
+        self._lock = threading.Lock()
 
     def get(self, latex: str) -> CachedRender | None:
         key = _cache_key(latex)
-        result = self._store.get(key)
-        if result is not None:
-            self._hits += 1
-        else:
-            self._misses += 1
-        return result
+        with self._lock:
+            result = self._store.get(key)
+            if result is not None:
+                self._hits += 1
+            else:
+                self._misses += 1
+            return result
 
     def put(self, latex: str, svg: str, cdm_score: float) -> None:
         """
@@ -80,12 +86,14 @@ class SessionEquationCache:
         a bad render cached is worse than a cache miss.
         """
         key = _cache_key(latex)
-        self._store[key] = CachedRender(svg=svg, cdm_score=cdm_score, latex=latex)
+        with self._lock:
+            self._store[key] = CachedRender(svg=svg, cdm_score=cdm_score, latex=latex)
 
     def clear(self) -> None:
-        self._store.clear()
-        self._hits = 0
-        self._misses = 0
+        with self._lock:
+            self._store.clear()
+            self._hits = 0
+            self._misses = 0
 
     def dump(self) -> list[dict]:
         """
