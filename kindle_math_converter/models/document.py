@@ -64,7 +64,7 @@ class EquationRegion:
     flagged_for_review: bool = False
     error_codes: list[str] = field(default_factory=list)
     failure_reason: Optional[FailureReason] = None
-    reading_order_index: Optional[int] = None  # Set in Stage 4 (unified with text blocks)
+    reading_order_index: Optional[float] = None  # Unified reading order across text/equations/figures
     dedup_canonical_id: Optional[str] = None   # Set in Stage 5B: region_id of canonical duplicate
     is_reference_label: bool = False           # Set in Stage 5B: looks like a footnote/reference marker
     render_as_text: bool = False               # Set in Stage 5B: simple enough to render as HTML text
@@ -76,7 +76,7 @@ class TextBlock:
     block_id: str
     bbox: BoundingBox
     raw_text: str
-    reading_order_index: int
+    reading_order_index: float
     source_image_crop: Optional[bytes] = None  # Masked PNG crop (scanned src), set in Stage 3; OCR'd in Stage 5A
 
 
@@ -88,7 +88,7 @@ class FigureBlock:
     bbox: BoundingBox
     image_bytes: Optional[bytes]   # PNG crop of the figure body
     alt_text: str                  # MinerU's VLM description of the image
-    reading_order_index: int
+    reading_order_index: float
 
 
 @dataclass

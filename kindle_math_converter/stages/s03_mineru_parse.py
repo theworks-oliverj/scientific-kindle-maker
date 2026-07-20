@@ -367,7 +367,20 @@ def run(
                 )
                 continue
 
-            # Text-like block (text, title, list, ref_text, unknown)
+            # List-like container (list of bullets, references section):
+            # nested sub-blocks are separate logical items — one paragraph
+            # each, not one flattened run. Ordered within the block by y0.
+            if block.get("blocks") and not block.get("lines"):
+                # Fractional order preserves the sub-block array sequence —
+                # a y0 tiebreak would interleave columns when the list spans
+                # two columns (MinerU's array is already in reading order).
+                for i, sub in enumerate(block.get("blocks", [])):
+                    harvest_text_block(
+                        sub, block_order + i / 1024, sub.get("bbox", bbox_pts)
+                    )
+                continue
+
+            # Text-like block (text, title, ref_text, unknown)
             harvest_text_block(block, block_order, bbox_pts)
 
         if page_img is not None:
