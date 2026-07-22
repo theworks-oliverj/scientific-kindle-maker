@@ -13,7 +13,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from .model_manager import load_all_models, get_models_dir
 from .observability.logger import configure_logging
 from .pipeline import Pipeline, PipelineConfig
 
@@ -29,42 +28,25 @@ def cli(ctx):
 
 
 @cli.command("download-models")
-@click.option("--models-dir", default=None,
-              help="Override model cache directory (default: ~/.kindle_converter/models).")
-def download_models_cmd(models_dir: str | None) -> None:
+def download_models_cmd() -> None:
     """
-    Pre-download all ML model weights from HuggingFace.
+    Pre-download the MinerU model weights from HuggingFace (~2.3 GB).
 
-    \b
-    Models downloaded:
-      - DocLayout-YOLO   (juliozhao/DocLayout-YOLO-DocStructBench)
-      - YOLOv8-MFD       (opendatalab/PDF-Extract-Kit-1.0 → models/MFD/yolov8_mix.pt)
-      - pix2tex          (auto-managed by pix2tex package, ~1.4 GB)
-      - PaddleOCR        (auto-managed by paddleocr package)
-
-    Weights are cached in ~/.kindle_converter/models/ and reused on subsequent runs.
-    Run this once before converting documents for the first time.
+    Optional — the first `convert` run downloads them automatically. If the
+    download stalls (seen with VPNs), set HF_HUB_DISABLE_XET=1 and re-run.
     """
+    import subprocess
+    import sys as _sys
     from pathlib import Path as _Path
-    mdir = _Path(models_dir) if models_dir else get_models_dir()
 
-    configure_logging(mdir / "download.log", verbose=True)
-
-    console.print(f"\n[bold]Downloading model weights[/bold]")
-    console.print(f"  Cache dir: {mdir}\n")
-
-    with console.status("[bold green]Downloading…", spinner="dots"):
-        models = load_all_models(mdir)
-
-    loaded  = [k for k, v in models.items() if v is not None]
-    missing = [k for k, v in models.items() if v is None]
-
-    console.print(f"  Loaded:  {', '.join(loaded) or 'none'}")
-    if missing:
-        console.print(f"  [yellow]Missing: {', '.join(missing)}[/yellow]")
-        console.print("  Install missing packages from requirements.txt and re-run.")
-    else:
+    hf_bin = _Path(_sys.executable).parent / "hf"
+    console.print("\n[bold]Downloading MinerU model weights[/bold] (opendatalab/MinerU2.5-Pro-2605-1.2B)")
+    rc = subprocess.run([str(hf_bin), "download", "opendatalab/MinerU2.5-Pro-2605-1.2B"]).returncode
+    if rc == 0:
         console.print("\n[bold green]All models ready.[/bold green]")
+    else:
+        console.print("\n[bold red]Download failed.[/bold red] "
+                      "If on a VPN, try: HF_HUB_DISABLE_XET=1 or disable the VPN.")
 
 
 @cli.command("convert")
@@ -87,6 +69,12 @@ def download_models_cmd(models_dir: str | None) -> None:
               help="Write cache dump JSON to output dir after completion.")
 @click.option("--no-epubcheck", is_flag=True, default=False,
               help="Skip epubcheck validation (useful if Java is not available).")
+@click.option("--fresh-parse", is_flag=True, default=False,
+              help="Re-run MinerU even if its output already exists in the "
+                   "output dir (default: reuse existing parse).")
+@click.option("--max-parallel-workers", default=None, type=int,
+              help="Worker threads for s06/s08a per-equation work "
+                   "(default: min(8, cpu_count)).")
 def main(
     input_path: str,
     output_dir: str,
@@ -98,6 +86,8 @@ def main(
     open_report: bool,
     dump_cache: bool,
     no_epubcheck: bool,
+    fresh_parse: bool,
+    max_parallel_workers: int | None,
 ) -> None:
     """
     Convert a PDF or EPUB to Kindle-compatible EPUB3 with properly rendered
@@ -127,6 +117,8 @@ def main(
         verbose_logging=verbose,
         dump_cache=dump_cache,
         epubcheck_enabled=not no_epubcheck,
+        mineru_reuse_existing=not fresh_parse,
+        max_parallel_workers=max_parallel_workers,
     )
 
     console.print(f"\n[bold]Kindle Math Converter[/bold]")
