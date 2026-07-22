@@ -29,7 +29,7 @@ from typing import Callable
 
 from ..concurrency import parallel_for_each
 from ..models.document import Document, EquationRegion, FailureReason
-from ..models.enums import ConfidenceGate, ErrorCode, FormulaClass, SourceType
+from ..models.enums import ConfidenceGate, ErrorCode, FormulaClass
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
 from ..observability.logger import get_logger
@@ -635,7 +635,12 @@ def run(
     bus.emit(stage, "stage_start")
     log.info("stage_start", equations=document.total_equation_count)
 
-    is_scanned = document.metadata.source_type == SourceType.VISUAL_PDF
+    # All sources now reach s06 via recognition (MinerU for PDFs, MathML
+    # conversion for EPUBs), so the compile+plausibility gate (Track B) is
+    # the single quality gate. Track A (SSIM against the source crop)
+    # predates MinerU and would mass-flag correct recognitions over mere
+    # font differences between the source and tectonic's render.
+    is_scanned = True
 
     # ── Skip regions handled outside the SVG pipeline (Stage 5B) ────
     eligible = [

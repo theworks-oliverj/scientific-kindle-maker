@@ -12,8 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from ..models.document import Document, Page, EquationRegion, TextBlock
-from ..models.enums import FormulaClass, ConfidenceGate, ErrorCode
+from ..models.document import Document, EquationRegion
+from ..models.enums import FormulaClass, ErrorCode
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
 from ..observability.logger import get_logger
@@ -132,24 +132,44 @@ def _render_equation(
 _EQ_PLACEHOLDER_RE = re.compile(r'\[\[EQ:([A-Za-z0-9_]+)\]\]')
 _EMPTY_P_RE = re.compile(r'<p>\s*</p>')
 
+# A paragraph whose visible text ends in one of these is considered complete;
+# anything else at a page boundary is treated as a continuation and merged.
+_TERMINAL_TAIL_RE = re.compile(r'[.!?:;…"”\'’)\]]\s*$')
 
-def _page_to_xhtml(
-    page: Page,
+
+def _valid_table_html(table_html: str) -> Optional[str]:
+    """Returns MinerU's table HTML if it is well-formed XML with a <table>
+    root (safe to inline in XHTML); None otherwise (caller falls back to
+    the raster crop)."""
+    try:
+        from lxml import etree  # type: ignore
+        root = etree.fromstring(table_html.encode())
+    except Exception:
+        return None
+    if root.tag != "table":
+        return None
+    return table_html
+
+
+def _document_to_chapters(
+    document: Document,
     title: str,
     bus: EventBus,
-    fallback_images: Optional[dict[str, bytes]] = None,
-) -> str:
-    """Converts a page's text blocks and equations into XHTML body content."""
-    # Build a combined reading-order list of text and equations
-    # For pages from PDF/scanned sources, interleave text and equations by y-position
+    embedded_images: dict[str, bytes],
+) -> list[tuple[str, str]]:
+    """
+    Assembles the whole document into section chapters:
 
-    body_parts = []
+    - one global reading-order stream across pages (text, figures, equations)
+    - paragraphs that continue across a page boundary are merged (the
+      previous page's last text unit lacks terminal punctuation), with
+      end-of-line hyphenation removed
+    - a new chapter starts at every heading (MinerU title block); content
+      before the first heading becomes the opening chapter
 
-    # Order content by the unified reading_order_index. Fall back to vertical
-    # position when the index is absent.
-    all_items: list[tuple[float, float, str]] = []
-
-    regions_by_id = {r.region_id: r for r in page.equation_regions}
+    Returns [(chapter_title, xhtml)].
+    """
+    regions_by_id = {r.region_id: r for r in document.all_equations}
     consumed: set[str] = set()
 
     def _substitute_placeholder(match: "re.Match[str]") -> str:
@@ -158,7 +178,7 @@ def _page_to_xhtml(
         consumed.add(region_id)
         if region is None:
             return ""
-        html = _render_equation(region, fallback_images)
+        html = _render_equation(region, embedded_images)
         if html is None:
             if region.flagged_for_review and not region.is_reference_label:
                 bus.emit(
@@ -171,47 +191,124 @@ def _page_to_xhtml(
             return f"</p>{html}<p>"
         return html
 
-    for block in page.text_blocks:
-        if not block.raw_text.strip():
-            continue  # skip blocks where OCR produced nothing
-        order = block.reading_order_index if block.reading_order_index is not None else block.bbox.y0
-        text_html = _EQ_PLACEHOLDER_RE.sub(
-            _substitute_placeholder, _escape_text(block.raw_text)
-        )
-        all_items.append((order, block.bbox.y0, _EMPTY_P_RE.sub("", f"<p>{text_html}</p>")))
+    # ── Pass 1: per-page reading-order units ────────────────────────────
+    units: list[dict] = []
+    for page in document.pages:
+        page_items: list[tuple[float, float, dict]] = []
 
-    for figure in page.figures:
-        if not figure.image_bytes:
-            continue
-        if fallback_images is not None:
-            fallback_images[figure.figure_id] = figure.image_bytes
-        fig_html = (
-            f'<div class="figure"><img alt="{_escape_text(figure.alt_text)}" '
-            f'src="../images/{figure.figure_id}.png"/></div>'
-        )
-        all_items.append((figure.reading_order_index, figure.bbox.y0, fig_html))
+        for block in page.text_blocks:
+            if not block.raw_text.strip():
+                continue
+            order = block.reading_order_index if block.reading_order_index is not None else block.bbox.y0
+            inner = _EQ_PLACEHOLDER_RE.sub(
+                _substitute_placeholder, _escape_text(block.raw_text)
+            )
+            # Visible tail (placeholders stripped) decides merge behaviour.
+            tail = _EQ_PLACEHOLDER_RE.sub("", block.raw_text).rstrip()
+            page_items.append((order, block.bbox.y0, {
+                "kind": block.kind, "inner": inner, "tail": tail,
+                "page": page.page_number,
+            }))
 
-    for region in page.equation_regions:
-        if region.region_id in consumed:
-            continue  # rendered inline within its paragraph
-        html = _render_equation(region, fallback_images)
-        if html is None:
-            if region.flagged_for_review and not region.is_reference_label:
-                bus.emit(
-                    "s10_epub_assembly", "equation_skipped",
-                    equation_id=region.region_id, reason="flagged_no_render",
+        for figure in page.figures:
+            table_html = _valid_table_html(figure.table_html) if figure.table_html else None
+            if table_html is not None:
+                fig_html = f'<div class="figure">{table_html}</div>'
+            elif figure.image_bytes:
+                embedded_images[figure.figure_id] = figure.image_bytes
+                fig_html = (
+                    f'<div class="figure"><img alt="{_escape_text(figure.alt_text)}" '
+                    f'src="../images/{figure.figure_id}.png"/></div>'
                 )
+            else:
+                continue
+            page_items.append((figure.reading_order_index, figure.bbox.y0, {
+                "kind": "figure", "html": fig_html, "page": page.page_number,
+            }))
+
+        for region in page.equation_regions:
+            if region.region_id in consumed:
+                continue  # rendered inline within its paragraph
+            html = _render_equation(region, embedded_images)
+            if html is None:
+                if region.flagged_for_review and not region.is_reference_label:
+                    bus.emit(
+                        "s10_epub_assembly", "equation_skipped",
+                        equation_id=region.region_id, reason="flagged_no_render",
+                    )
+                continue
+            order = region.reading_order_index if region.reading_order_index is not None else region.bbox.y0
+            page_items.append((order, region.bbox.y0, {
+                "kind": "equation", "html": html, "page": page.page_number,
+            }))
+
+        page_items.sort(key=lambda x: (x[0], x[1]))
+        units.extend(item for _, _, item in page_items)
+
+    # ── Pass 2: merge continuation paragraphs across page boundaries ────
+    merged: list[dict] = []
+    for unit in units:
+        prev = merged[-1] if merged else None
+        # A paragraph continues across a column or page break when its
+        # previous half does not end in terminal punctuation. The units are
+        # already in reading order, so adjacency in the stream is the signal;
+        # allow the break within the same page (column) or onto the next
+        # page, but not larger jumps.
+        if (
+            prev is not None
+            and unit.get("inner") is not None
+            and prev.get("inner") is not None
+            and prev["page"] <= unit["page"] <= prev["page"] + 1
+            and unit["kind"] == prev["kind"]
+            and prev["kind"] == "text"
+            and prev["tail"]
+            and not _TERMINAL_TAIL_RE.search(prev["tail"])
+        ):
+            if prev["inner"].rstrip().endswith("-"):
+                prev["inner"] = prev["inner"].rstrip()[:-1] + unit["inner"]
+            else:
+                prev["inner"] = prev["inner"].rstrip() + " " + unit["inner"]
+            prev["tail"] = unit["tail"]
+            prev["page"] = unit["page"]
             continue
-        order = region.reading_order_index if region.reading_order_index is not None else region.bbox.y0
-        all_items.append((order, region.bbox.y0, html))
+        merged.append(unit)
 
-    all_items.sort(key=lambda x: (x[0], x[1]))
-    body_parts = [html for _, _, html in all_items]
+    # ── Pass 3: split into chapters at headings ─────────────────────────
+    chapters: list[tuple[str, list[str]]] = []
+    current_title = title
+    current_parts: list[str] = []
 
-    if not body_parts:
-        body_parts = ["<p>&#160;</p>"]
+    def _flush() -> None:
+        nonlocal current_parts
+        if current_parts:
+            chapters.append((current_title, current_parts))
+        current_parts = []
 
-    return XHTML_TEMPLATE.format(title=f"{title} — Page {page.page_number}", body="\n".join(body_parts))
+    for unit in merged:
+        if unit["kind"] == "heading":
+            _flush()
+            current_title = _EQ_PLACEHOLDER_RE.sub(
+                "", re.sub(r"<[^>]+>", "", unit["inner"])
+            ).strip() or "Untitled section"
+            # Headings hold at most inline math — strip any paragraph-split
+            # artifacts a display placeholder would have produced.
+            heading_inner = unit["inner"].replace("</p>", "").replace("<p>", "")
+            current_parts.append(f"<h2>{heading_inner}</h2>")
+        elif unit.get("inner") is not None:
+            current_parts.append(_EMPTY_P_RE.sub("", f'<p>{unit["inner"]}</p>'))
+        else:
+            current_parts.append(unit["html"])
+    _flush()
+
+    if not chapters:
+        chapters = [(title, ["<p>&#160;</p>"])]
+
+    return [
+        (chapter_title, XHTML_TEMPLATE.format(
+            title=_escape_text(chapter_title), body="\n".join(parts),
+        ))
+        for chapter_title, parts in chapters
+    ]
 
 
 def _escape_text(text: str) -> str:
@@ -271,10 +368,10 @@ def _build_opf(
 """
 
 
-def _build_nav(title: str, chapters: list[str]) -> str:
+def _build_nav(title: str, chapter_titles: list[str]) -> str:
     items = "\n    ".join(
-        f'<li><a href="content/chapter_{i+1:03d}.xhtml">Chapter {i+1}</a></li>'
-        for i in range(len(chapters))
+        f'<li><a href="content/chapter_{i+1:03d}.xhtml">{_escape_text(ct)}</a></li>'
+        for i, ct in enumerate(chapter_titles)
     )
     return f"""\
 <?xml version="1.0" encoding="utf-8"?>
@@ -293,12 +390,12 @@ def _build_nav(title: str, chapters: list[str]) -> str:
 """
 
 
-def _build_ncx(title: str, uid: str, chapters: list[str]) -> str:
+def _build_ncx(title: str, uid: str, chapter_titles: list[str]) -> str:
     nav_points = "\n  ".join(
         f'<navPoint id="navPoint{i+1}" playOrder="{i+1}">'
-        f'<navLabel><text>Chapter {i+1}</text></navLabel>'
+        f'<navLabel><text>{_escape_text(ct)}</text></navLabel>'
         f'<content src="content/chapter_{i+1:03d}.xhtml"/></navPoint>'
-        for i in range(len(chapters))
+        for i, ct in enumerate(chapter_titles)
     )
     return f"""\
 <?xml version="1.0" encoding="utf-8"?>
@@ -392,13 +489,13 @@ def run(
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Generate XHTML for each page/chapter. Flagged equations with a
-        # source crop are embedded as raster images collected here.
+        # Assemble section chapters from the whole document (cross-page
+        # paragraph flow, headings). Figure crops and flagged-equation
+        # fallbacks are collected as embedded images.
         fallback_images: dict[str, bytes] = {}
-        chapters_xhtml = [
-            _page_to_xhtml(page, title, bus, fallback_images)
-            for page in document.pages
-        ]
+        titled_chapters = _document_to_chapters(document, title, bus, fallback_images)
+        chapter_titles = [t for t, _ in titled_chapters]
+        chapters_xhtml = [x for _, x in titled_chapters]
 
         with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zf:
             # mimetype must be first and uncompressed
@@ -431,8 +528,8 @@ def run(
                 zf.writestr(f"OEBPS/images/{img_id}.png", png_bytes)
 
             # Navigation
-            zf.writestr("OEBPS/nav.xhtml", _build_nav(title, chapters_xhtml))
-            zf.writestr("OEBPS/toc.ncx", _build_ncx(title, uid, chapters_xhtml))
+            zf.writestr("OEBPS/nav.xhtml", _build_nav(title, chapter_titles))
+            zf.writestr("OEBPS/toc.ncx", _build_ncx(title, uid, chapter_titles))
 
             # Package document
             zf.writestr(

@@ -18,7 +18,6 @@ from .observability.logger import get_logger
 
 from .stages import (
     s01_classifier,
-    s02a_digital_pdf,
     s02b_visual,
     s02c_epub,
     s03_mineru_parse,
@@ -140,14 +139,16 @@ class Pipeline:
         if not sr1.ok or metadata is None:
             raise FatalPipelineError(f"Stage 1 failed: {sr1.errors}")
 
-        # Stage 2: Source-specific extraction (fatal on failure)
+        # Stage 2: Source-specific extraction (fatal on failure).
+        # ALL PDFs — scanned and digital — are rasterized via s02b: MinerU
+        # owns text/formula extraction either way, and the 300dpi page
+        # rasters supply equation/figure crops for the quality gate and
+        # raster fallbacks.
         source_type = metadata.source_type
         if source_type == SourceType.EPUB or source_type == SourceType.HTML:
             document, sr2 = s02c_epub.run(metadata, self.bus)
-        elif source_type == SourceType.VISUAL_PDF or metadata.is_scanned:
-            document, sr2 = s02b_visual.run(metadata, self.bus)
         else:
-            document, sr2 = s02a_digital_pdf.run(metadata, self.bus)
+            document, sr2 = s02b_visual.run(metadata, self.bus)
 
         result.stage_results.append(sr2)
         if not sr2.ok:

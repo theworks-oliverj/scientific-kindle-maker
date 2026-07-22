@@ -215,7 +215,9 @@ def run(
         page_img, sx, sy = _page_image_and_scale(page, page_info.get("page_size", [612, 792]))
         eq_counter = 0
 
-        def harvest_text_block(block: dict, block_order, bbox_pts: list) -> None:
+        def harvest_text_block(
+            block: dict, block_order, bbox_pts: list, kind: str = "text"
+        ) -> None:
             """Walks a text-like block's spans into a TextBlock, creating
             inline/display EquationRegions with placeholders as it goes."""
             nonlocal eq_counter, n_text_blocks, n_display, n_inline, n_rendered_as_text
@@ -286,6 +288,7 @@ def run(
                     bbox=_pixel_bbox(bbox_pts, sx, sy, page_number),
                     raw_text=raw_text,
                     reading_order_index=block_order,
+                    kind=kind,
                 )
             )
             n_text_blocks += 1
@@ -335,6 +338,7 @@ def run(
                 # footnote sub-blocks are harvested as normal text.
                 body_bbox: Optional[list] = None
                 alt_text = ""
+                table_html: Optional[str] = None
                 for sub in block.get("blocks", []):
                     sub_type = sub.get("type", "")
                     if sub_type.endswith("_body"):
@@ -344,6 +348,10 @@ def run(
                             for line in sub.get("lines", [])
                             for s in line.get("spans", [])
                         ).strip()
+                        for line in sub.get("lines", []):
+                            for s in line.get("spans", []):
+                                if s.get("html"):
+                                    table_html = s["html"]
                     else:
                         harvest_text_block(sub, block_order, sub.get("bbox", bbox_pts))
 
@@ -357,6 +365,7 @@ def run(
                     image_bytes=fig_bytes,
                     alt_text=alt_text or f"{btype} on page {page_number}",
                     reading_order_index=block_order,
+                    table_html=table_html,
                 )
                 page.figures.append(figure)
                 n_figures += 1
@@ -376,12 +385,16 @@ def run(
                 # two columns (MinerU's array is already in reading order).
                 for i, sub in enumerate(block.get("blocks", [])):
                     harvest_text_block(
-                        sub, block_order + i / 1024, sub.get("bbox", bbox_pts)
+                        sub, block_order + i / 1024, sub.get("bbox", bbox_pts),
+                        kind="list_item",
                     )
                 continue
 
             # Text-like block (text, title, ref_text, unknown)
-            harvest_text_block(block, block_order, bbox_pts)
+            harvest_text_block(
+                block, block_order, bbox_pts,
+                kind="heading" if btype == "title" else "text",
+            )
 
         if page_img is not None:
             page_img.close()

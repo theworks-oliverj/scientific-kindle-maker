@@ -78,6 +78,7 @@ class TextBlock:
     raw_text: str
     reading_order_index: float
     source_image_crop: Optional[bytes] = None  # Masked PNG crop (scanned src), set in Stage 3; OCR'd in Stage 5A
+    kind: str = "text"                         # "text" | "heading" | "list_item"
 
 
 @dataclass
@@ -89,6 +90,7 @@ class FigureBlock:
     image_bytes: Optional[bytes]   # PNG crop of the figure body
     alt_text: str                  # MinerU's VLM description of the image
     reading_order_index: float
+    table_html: Optional[str] = None  # MinerU table HTML — preferred over the image when XML-valid
 
 
 @dataclass
