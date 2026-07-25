@@ -67,12 +67,21 @@ BOOK_CSS = """\
 span.eq-inline img.eq-img-fallback { height: 1.2em; width: auto; vertical-align: middle; }
 .figure { text-align: center; margin: 1em 0; }
 .figure img { max-width: 100%; }
+
+/* Footnotes recovered from the page furniture, collected at the end of the
+   section holding their reference. Readers that support EPUB3 popup notes
+   show the <aside> without leaving the page; everywhere else it is a normal
+   jump, so each note carries a back-link. */
+.footnotes { border-top: 1px solid currentColor; margin-top: 2em; padding-top: 0.5em; }
+.footnotes p { font-size: 0.85em; margin: 0.4em 0; }
+.footnote-back { text-decoration: none; }
+a.noteref { text-decoration: none; }
 """
 
 XHTML_TEMPLATE = """\
 <?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="en">
 <head>
 <meta charset="utf-8"/>
 <title>{title}</title>
@@ -101,7 +110,17 @@ def _render_equation(
     the EPUB) — for a reading tool, a raster equation beats a missing one.
     """
     if region.render_as_text:
-        return f'<span class="eq-text">{region.inline_text_repr}</span>'
+        span = f'<span class="eq-text">{region.inline_text_repr}</span>'
+        if region.footnote_ref_id:
+            # epub:type="noteref" is what makes Kindle render the note as a
+            # tap-to-open popup instead of jumping the reader away; other
+            # readers fall back to following the link.
+            return (
+                f'<a class="noteref" epub:type="noteref" '
+                f'id="{_noteref_anchor_id(region.footnote_ref_id)}" '
+                f'href="#{region.footnote_ref_id}">{span}</a>'
+            )
+        return span
 
     if region.is_reference_label:
         return None
@@ -126,6 +145,31 @@ def _render_equation(
         return f'<div class="eq-display">{_eq_number_html(region)}{svg}</div>'
 
 
+def _noteref_anchor_id(footnote_id: str) -> str:
+    """Id of the in-text marker that points at `footnote_id` ("fn_2_1" ->
+    "fnref_2_1"), so the note can link back to where the reader was."""
+    return "fnref_" + footnote_id[3:] if footnote_id.startswith("fn_") else f"fnref_{footnote_id}"
+
+
+def _footnote_html(unit: dict, back_link: bool) -> str:
+    """One recovered footnote as an EPUB3 <aside>.
+
+    `back_link` must only be True when the marker anchor is in the same
+    chapter file — an id="…" that isn't there is a dangling fragment.
+    """
+    back = ""
+    if back_link and unit["footnote_id"]:
+        back = (
+            f' <a class="footnote-back" '
+            f'href="#{_noteref_anchor_id(unit["footnote_id"])}">↩</a>'
+        )
+    attrs = f' id="{unit["footnote_id"]}"' if unit["footnote_id"] else ""
+    return (
+        f'<aside epub:type="footnote"{attrs}>'
+        f'<p>{unit["inner"]}{back}</p></aside>'
+    )
+
+
 def _eq_number_html(region: EquationRegion) -> str:
     """The equation-number span, or "" if the equation is unnumbered.
 
@@ -142,6 +186,8 @@ def _eq_number_html(region: EquationRegion) -> str:
 # s03_mineru_parse (uses only characters that survive _escape_text).
 _EQ_PLACEHOLDER_RE = re.compile(r'\[\[EQ:([A-Za-z0-9_]+)\]\]')
 _EMPTY_P_RE = re.compile(r'<p>\s*</p>')
+# The footnote id an emitted in-text marker points at (see _render_equation).
+_NOTEREF_ID_RE = re.compile(r'<a class="noteref"[^>]*href="#(fn_[^"]+)"')
 
 # A paragraph whose visible text ends in one of these is considered complete;
 # anything else at a page boundary is treated as a continuation and merged.
@@ -297,6 +343,11 @@ def _document_to_chapters(
 
     # ── Pass 1: per-page reading-order units ────────────────────────────
     units: list[dict] = []
+    # Footnotes are held out of the reading-order stream entirely and placed
+    # by Pass 3 at the end of the section holding their reference. Leaving
+    # them inline would drop a block between a page's last paragraph and the
+    # next page's first, breaking the cross-page continuation merge below.
+    footnotes: list[dict] = []
     for page in document.pages:
         page_items: list[tuple[float, float, dict]] = []
 
@@ -309,6 +360,12 @@ def _document_to_chapters(
             )
             # Visible tail (placeholders stripped) decides merge behaviour.
             tail = _EQ_PLACEHOLDER_RE.sub("", block.raw_text).rstrip()
+            if block.kind == "footnote":
+                footnotes.append({
+                    "footnote_id": block.footnote_id, "inner": inner,
+                    "page": page.page_number,
+                })
+                continue
             page_items.append((order, block.bbox.y0, {
                 "kind": block.kind, "inner": inner, "tail": tail,
                 "page": page.page_number,
@@ -377,16 +434,65 @@ def _document_to_chapters(
             continue
         merged.append(unit)
 
-    # ── Pass 3: split into chapters at headings ─────────────────────────
+    # ── Pass 3: split into chapters at headings, footnotes at section end ─
     chapters: list[tuple[str, list[str]]] = []
     current_title = title
     current_parts: list[str] = []
+    pending_notes = list(footnotes)      # document order, drained as placed
+    linked_note_ids = {
+        r.footnote_ref_id for r in document.all_equations if r.footnote_ref_id
+    }
+    refs_in_chapter: set[str] = set()    # note ids whose marker appeared here
+    max_page_in_chapter = 0
 
-    def _flush() -> None:
-        nonlocal current_parts
-        if current_parts:
-            chapters.append((current_title, current_parts))
+    def _place_notes(final: bool = False) -> list[str]:
+        """Notes owed by the section just closed.
+
+        A linked note goes with the section holding its reference marker, so
+        the popup link and its back-link stay inside one file — it waits for
+        that marker however many sections that takes. An unlinked note has no
+        anchor to chase, so it waits until a section has moved past its page
+        (strictly: contains content from a later one), which is the point its
+        page is known to be finished.
+
+        Placing a linked note early would strand it in a different file from
+        its marker, which is a dangling fragment and an epubcheck error.
+        """
+        nonlocal pending_notes
+        due, keep = [], []
+        for note in pending_notes:
+            linked = note["footnote_id"] in linked_note_ids
+            owed = final or (
+                note["footnote_id"] in refs_in_chapter if linked
+                else note["page"] < max_page_in_chapter
+            )
+            (due if owed else keep).append(note)
+        pending_notes = keep
+        if not due:
+            return []
+        return [
+            '<div class="footnotes">'
+            + "".join(
+                _footnote_html(note, back_link=note["footnote_id"] in refs_in_chapter)
+                for note in due
+            )
+            + "</div>"
+        ]
+
+    def _flush(final: bool = False) -> None:
+        nonlocal current_parts, refs_in_chapter, max_page_in_chapter
+        notes = _place_notes(final) if (current_parts or final) else []
+        if current_parts or notes:
+            chapters.append((current_title, current_parts + notes))
         current_parts = []
+        refs_in_chapter = set()
+        max_page_in_chapter = 0
+
+    def _emit(part: str, page: int) -> None:
+        nonlocal max_page_in_chapter
+        current_parts.append(part)
+        max_page_in_chapter = max(max_page_in_chapter, page)
+        refs_in_chapter.update(_NOTEREF_ID_RE.findall(part))
 
     for unit in merged:
         if unit["kind"] == "heading":
@@ -397,12 +503,12 @@ def _document_to_chapters(
             # Headings hold at most inline math — strip any paragraph-split
             # artifacts a display placeholder would have produced.
             heading_inner = unit["inner"].replace("</p>", "").replace("<p>", "")
-            current_parts.append(f"<h2>{heading_inner}</h2>")
+            _emit(f"<h2>{heading_inner}</h2>", unit["page"])
         elif unit.get("inner") is not None:
-            current_parts.append(_EMPTY_P_RE.sub("", f'<p>{unit["inner"]}</p>'))
+            _emit(_EMPTY_P_RE.sub("", f'<p>{unit["inner"]}</p>'), unit["page"])
         else:
-            current_parts.append(unit["html"])
-    _flush()
+            _emit(unit["html"], unit["page"])
+    _flush(final=True)
 
     if not chapters:
         chapters = [(title, ["<p>&#160;</p>"])]

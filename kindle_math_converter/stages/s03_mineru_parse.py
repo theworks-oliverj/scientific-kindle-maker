@@ -19,7 +19,10 @@ middle.json schema this is written against (observed from MinerU 3.4.4):
                            order), lines[].spans[]:
       type ∈ {text, inline_equation, interline_equation}, content (LaTeX for
       equations), bbox
-    discarded_blocks[]: headers/footers — intentionally dropped.
+    discarded_blocks[]: type ∈ {header, footer, page_number, page_footnote}.
+      The first three are page furniture and dropped; `page_footnote` is real
+      content (footnote bodies, which carry citations and inline maths) and is
+      harvested — see the footnote section of the page loop.
 
 Inline equations are embedded in their paragraph's raw_text as
 "[[EQ:region_id]]" placeholders; s10 substitutes the rendered form (HTML
@@ -28,6 +31,7 @@ text span or inline SVG) in place, keeping sentences intact.
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -55,6 +59,9 @@ STAGE = "s03_mineru_parse"
 # fall through to text handling (defensive: better a paragraph than a hole).
 _EQUATION_BLOCK_TYPE = "interline_equation"
 _MEDIA_BLOCK_TYPES = {"image", "table"}
+# The one discarded_blocks type that is content rather than page furniture
+# (the others seen in this corpus: header, footer, page_number).
+_FOOTNOTE_BLOCK_TYPE = "page_footnote"
 
 _CROP_PAD_PX = 4
 
@@ -141,6 +148,68 @@ def _pixel_bbox(bbox_pts: list, sx: float, sy: float, page_number: int) -> Bound
     )
 
 
+# A standalone "^{N}" inline equation renders as "<sup>N</sup>" (see
+# equation_filters.simple_text_repr) — the shape of a footnote reference in
+# the body text, and of the marker that opens the footnote itself.
+_SUP_MARKER_RE = re.compile(r'^<sup>(\d+)</sup>$')
+_RAW_MARKER_RE = re.compile(r'^\^\s*\{\s*(\d+)\s*\}$')
+
+# Footnote text blocks sort after every para_block on their page: they are
+# pulled out of the main stream by s10 anyway, so this only orders them
+# among themselves (and keeps them last if anything ever leaks through).
+_FOOTNOTE_ORDER_BASE = 1_000_000
+
+
+def _marker_number(region: EquationRegion) -> Optional[str]:
+    """The footnote number this region marks, or None if it isn't a marker."""
+    if not region.render_as_text or not region.inline_text_repr:
+        return None
+    m = _SUP_MARKER_RE.match(region.inline_text_repr)
+    return m.group(1) if m else None
+
+
+def _link_footnotes_to_markers(
+    footnote_blocks: list[TextBlock],
+    footnote_numbers: list[Optional[str]],
+    body_markers: list[EquationRegion],
+) -> int:
+    """Points each body reference at the footnote it opens.
+
+    A page footnote's marker is by definition printed on the same page, so
+    matching is scoped to one page — which is what makes it safe. A pairing
+    is only made when the number is unambiguous on BOTH sides: exactly one
+    footnote and exactly one body marker carry it. Anything else stays
+    unlinked rather than risk sending the reader to the wrong note. OCR does
+    misread these — in the SU3 paper footnote 3's marker came through as "8",
+    colliding with the real footnote 8 — and a body "^{2}" may simply be an
+    exponent rather than a reference.
+
+    Every footnote keeps its anchor id either way; only the link is withheld.
+    Returns the number of pairs linked.
+    """
+    fn_counts: dict[str, int] = {}
+    for number in footnote_numbers:
+        if number:
+            fn_counts[number] = fn_counts.get(number, 0) + 1
+
+    markers_by_number: dict[str, list[EquationRegion]] = {}
+    for region in body_markers:
+        number = _marker_number(region)
+        if number:
+            markers_by_number.setdefault(number, []).append(region)
+
+    linked = 0
+    for block, number in zip(footnote_blocks, footnote_numbers):
+        if not number or fn_counts.get(number, 0) != 1:
+            continue
+        candidates = markers_by_number.get(number, [])
+        if len(candidates) != 1:
+            continue
+        candidates[0].footnote_ref_id = block.footnote_id
+        linked += 1
+    return linked
+
+
 def _iter_lines(block: dict):
     """Yields line dicts from a block, recursing into nested sub-blocks
     (list items, image/table captions)."""
@@ -205,6 +274,8 @@ def run(
     n_inline = 0
     n_rendered_as_text = 0
     n_figures = 0
+    n_footnotes = 0
+    n_footnote_links = 0
 
     for page_info in pdf_info:
         page_idx = page_info.get("page_idx", 0)
@@ -396,6 +467,49 @@ def run(
                 kind="heading" if btype == "title" else "text",
             )
 
+        # ── Page footnotes (from discarded_blocks) ───────────────────────
+        # MinerU types its discard pile, and `page_footnote` entries are real
+        # content — footnote bodies carrying citations and, in this corpus,
+        # inline maths. Only headers/footers/page numbers are furniture.
+        # Harvested through the same path as body text so their inline
+        # equations become placeholders and render properly.
+        #
+        # Snapshot the body markers FIRST: a footnote opens with its own
+        # "^{N}" span, which becomes a marker-shaped region too and would
+        # otherwise pollute the pool it is matched against.
+        body_markers = [r for r in page.equation_regions if _marker_number(r)]
+        footnote_blocks: list[TextBlock] = []
+        footnote_numbers: list[Optional[str]] = []
+        for i, block in enumerate(page_info.get("discarded_blocks", [])):
+            if block.get("type") != _FOOTNOTE_BLOCK_TYPE:
+                continue
+            before = len(page.text_blocks)
+            harvest_text_block(
+                block, _FOOTNOTE_ORDER_BASE + i, block.get("bbox", [0, 0, 0, 0]),
+                kind="footnote",
+            )
+            if len(page.text_blocks) == before:
+                continue  # empty after harvesting
+            note = page.text_blocks[-1]
+            note.footnote_id = f"fn_{page_number}_{len(footnote_blocks) + 1}"
+            footnote_blocks.append(note)
+            first_span = next(
+                (
+                    (s.get("content") or "").strip()
+                    for line in _iter_lines(block)
+                    for s in line.get("spans", [])
+                    if (s.get("content") or "").strip()
+                ),
+                "",
+            )
+            m = _RAW_MARKER_RE.match(first_span)
+            footnote_numbers.append(m.group(1) if m else None)
+            n_footnotes += 1
+
+        n_footnote_links += _link_footnotes_to_markers(
+            footnote_blocks, footnote_numbers, body_markers,
+        )
+
         if page_img is not None:
             page_img.close()
 
@@ -427,6 +541,8 @@ def run(
         "rendered_as_text": n_rendered_as_text,
         "deduped": n_deduped,
         "figures_embedded": n_figures,
+        "footnotes": n_footnotes,
+        "footnote_links": n_footnote_links,
     }
     bus.emit(STAGE, "stage_end", equation_id=None, **metrics)
     log.info("stage_end", **metrics)
