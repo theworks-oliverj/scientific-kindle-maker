@@ -69,19 +69,18 @@ span.eq-inline img.eq-img-fallback { height: 1.2em; width: auto; vertical-align:
 .figure img { max-width: 100%; }
 
 /* Footnotes recovered from the page furniture, collected at the end of the
-   section holding their reference. Readers that support EPUB3 popup notes
-   show the <aside> without leaving the page; everywhere else it is a normal
-   jump, so each note carries a back-link. */
+   section holding their reference. Ordinary paragraphs on purpose — the
+   EPUB3 popup markup gets hidden by reading systems (see _footnote_html). */
 .footnotes { border-top: 1px solid currentColor; margin-top: 2em; padding-top: 0.5em; }
-.footnotes p { font-size: 0.85em; margin: 0.4em 0; }
+.footnotes-title { font-size: 0.8em; font-weight: bold; margin: 0 0 0.4em 0; }
+.footnote { font-size: 0.85em; margin: 0.4em 0; text-indent: 0; }
 .footnote-back { text-decoration: none; }
-a.noteref { text-decoration: none; }
 """
 
 XHTML_TEMPLATE = """\
 <?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="en">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
 <head>
 <meta charset="utf-8"/>
 <title>{title}</title>
@@ -112,11 +111,12 @@ def _render_equation(
     if region.render_as_text:
         span = f'<span class="eq-text">{region.inline_text_repr}</span>'
         if region.footnote_ref_id:
-            # epub:type="noteref" is what makes Kindle render the note as a
-            # tap-to-open popup instead of jumping the reader away; other
-            # readers fall back to following the link.
+            # A plain link, not epub:type="noteref" — see _footnote_html for
+            # why the popup markup had to go. Tapping jumps to the note at the
+            # end of the section (always the same file), and the note links
+            # back here.
             return (
-                f'<a class="noteref" epub:type="noteref" '
+                f'<a class="noteref" '
                 f'id="{_noteref_anchor_id(region.footnote_ref_id)}" '
                 f'href="#{region.footnote_ref_id}">{span}</a>'
             )
@@ -152,10 +152,18 @@ def _noteref_anchor_id(footnote_id: str) -> str:
 
 
 def _footnote_html(unit: dict, back_link: bool) -> str:
-    """One recovered footnote as an EPUB3 <aside>.
+    """One recovered footnote as an ordinary, always-visible paragraph.
+
+    Deliberately NOT <aside epub:type="footnote">. That is the EPUB3 markup
+    for popup notes, and reading systems that implement popups take the aside
+    out of the normal flow via their own stylesheet — so where the popup does
+    not fire, the note is simply invisible. Observed on both a desktop EPUB
+    reader and Kindle: all ten recovered notes silently disappeared. A plain
+    <p> cannot be hidden that way, and the marker/back-link pair still gives
+    two-way navigation everywhere.
 
     `back_link` must only be True when the marker anchor is in the same
-    chapter file — an id="…" that isn't there is a dangling fragment.
+    chapter file — an href="#…" with no target is a dangling fragment.
     """
     back = ""
     if back_link and unit["footnote_id"]:
@@ -164,10 +172,7 @@ def _footnote_html(unit: dict, back_link: bool) -> str:
             f'href="#{_noteref_anchor_id(unit["footnote_id"])}">↩</a>'
         )
     attrs = f' id="{unit["footnote_id"]}"' if unit["footnote_id"] else ""
-    return (
-        f'<aside epub:type="footnote"{attrs}>'
-        f'<p>{unit["inner"]}{back}</p></aside>'
-    )
+    return f'<p class="footnote"{attrs}>{unit["inner"]}{back}</p>'
 
 
 def _eq_number_html(region: EquationRegion) -> str:
@@ -471,7 +476,7 @@ def _document_to_chapters(
         if not due:
             return []
         return [
-            '<div class="footnotes">'
+            '<div class="footnotes"><p class="footnotes-title">Notes</p>'
             + "".join(
                 _footnote_html(note, back_link=note["footnote_id"] in refs_in_chapter)
                 for note in due
