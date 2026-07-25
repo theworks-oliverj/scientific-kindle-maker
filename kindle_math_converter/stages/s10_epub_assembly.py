@@ -191,6 +191,14 @@ def _eq_number_html(region: EquationRegion) -> str:
 # s03_mineru_parse (uses only characters that survive _escape_text).
 _EQ_PLACEHOLDER_RE = re.compile(r'\[\[EQ:([A-Za-z0-9_]+)\]\]')
 _EMPTY_P_RE = re.compile(r'<p>\s*</p>')
+
+# Kindle's publishing guidelines cap a single XHTML file at 300 KB. Measured
+# before the budget existed, and against dvisvgm's uncompressed outlines: the
+# SU3 paper produced a 505 KB section and a 229 KB one, and neither rendered
+# reliably on device — while a document whose largest file was 91 KB was
+# fine. The budget is checked before glyph dedup shrinks the file, so the
+# written files land well under the cap.
+MAX_CHAPTER_BYTES = 250_000
 # The footnote id an emitted in-text marker points at (see _render_equation).
 _NOTEREF_ID_RE = re.compile(r'<a class="noteref"[^>]*href="#(fn_[^"]+)"')
 
@@ -292,6 +300,47 @@ def _linkify(escaped_text: str) -> str:
     return _URL_RE.sub(replace, escaped_text)
 
 
+# dvisvgm emits one <path id="…" d="…"/> glyph definition per equation, and
+# s09 namespaces those ids per region so they stay unique when many equations
+# share an XHTML file. The letter "S" therefore gets re-embedded in full for
+# every equation that uses it — 80% of a maths-heavy chapter turned out to be
+# duplicated outline data (638 defs for 227 distinct shapes in one chapter).
+_GLYPH_DEF_RE = re.compile(r'<path id="([^"]+)" d="([^"]+)"/>')
+
+
+def _dedupe_glyph_defs(xhtml: str) -> str:
+    """Collapses identical glyph outlines within one XHTML file to a single
+    definition, repointing every <use> at the survivor.
+
+    Keyed on the outline data, never on the id: dvisvgm numbers glyphs
+    per-render, so the same id means different shapes in different equations
+    (42 such collisions in one chapter here). That is exactly why s09
+    namespaces them, and why this must not simply strip the namespace.
+    """
+    canonical_by_outline: dict[str, str] = {}
+    alias: dict[str, str] = {}
+
+    def keep_first(match: "re.Match[str]") -> str:
+        glyph_id, outline = match.group(1), match.group(2)
+        first = canonical_by_outline.get(outline)
+        if first is None:
+            canonical_by_outline[outline] = glyph_id
+            return match.group(0)
+        alias[glyph_id] = first
+        return ""
+
+    xhtml = _GLYPH_DEF_RE.sub(keep_first, xhtml)
+    if not alias:
+        return xhtml
+    # Only <use href="#glyph"> can name these ids; footnote anchors are never
+    # in the map, so they pass through untouched.
+    return re.sub(
+        r'href="#([^"]+)"',
+        lambda m: f'href="#{alias.get(m.group(1), m.group(1))}"',
+        xhtml,
+    )
+
+
 def _valid_table_html(table_html: str) -> Optional[str]:
     """Returns MinerU's table HTML if it is well-formed XML with a <table>
     root (safe to inline in XHTML); None otherwise (caller falls back to
@@ -311,7 +360,7 @@ def _document_to_chapters(
     title: str,
     bus: EventBus,
     embedded_images: dict[str, bytes],
-) -> list[tuple[str, str]]:
+) -> list[tuple[Optional[str], str]]:
     """
     Assembles the whole document into section chapters:
 
@@ -440,9 +489,12 @@ def _document_to_chapters(
         merged.append(unit)
 
     # ── Pass 3: split into chapters at headings, footnotes at section end ─
-    chapters: list[tuple[str, list[str]]] = []
-    current_title = title
+    # `title` is None for a continuation file — same section, split only
+    # because it outgrew MAX_CHAPTER_BYTES, and so kept out of the TOC.
+    chapters: list[tuple[Optional[str], list[str]]] = []
+    current_title: Optional[str] = title
     current_parts: list[str] = []
+    current_bytes = 0
     pending_notes = list(footnotes)      # document order, drained as placed
     linked_note_ids = {
         r.footnote_ref_id for r in document.all_equations if r.footnote_ref_id
@@ -484,20 +536,34 @@ def _document_to_chapters(
             + "</div>"
         ]
 
-    def _flush(final: bool = False) -> None:
-        nonlocal current_parts, refs_in_chapter, max_page_in_chapter
+    def _flush(final: bool = False, split: bool = False) -> None:
+        """Closes the current XHTML file. `split` means the section continues
+        in the next file, so its notes-so-far are settled here (their markers
+        are in THIS file) and the next file carries no TOC entry."""
+        nonlocal current_parts, current_bytes, refs_in_chapter
+        nonlocal max_page_in_chapter, current_title
         notes = _place_notes(final) if (current_parts or final) else []
         if current_parts or notes:
             chapters.append((current_title, current_parts + notes))
+        if split:
+            current_title = None
         current_parts = []
+        current_bytes = 0
         refs_in_chapter = set()
         max_page_in_chapter = 0
 
     def _emit(part: str, page: int) -> None:
-        nonlocal max_page_in_chapter
+        nonlocal max_page_in_chapter, current_bytes
         current_parts.append(part)
+        current_bytes += len(part)
         max_page_in_chapter = max(max_page_in_chapter, page)
         refs_in_chapter.update(_NOTEREF_ID_RE.findall(part))
+        # Kindle's publishing guidelines cap one XHTML file at 300 KB, and a
+        # maths-heavy section blows past that on inline SVG alone (505 KB
+        # observed) — the whole file then renders unreliably on device. Break
+        # between units so no paragraph or equation is ever split.
+        if current_bytes > MAX_CHAPTER_BYTES:
+            _flush(split=True)
 
     for unit in merged:
         if unit["kind"] == "heading":
@@ -518,10 +584,12 @@ def _document_to_chapters(
     if not chapters:
         chapters = [(title, ["<p>&#160;</p>"])]
 
+    # Glyph dedup is per FILE, so it runs after the split above has decided
+    # where the file boundaries are.
     return [
-        (chapter_title, XHTML_TEMPLATE.format(
-            title=_escape_text(chapter_title), body="\n".join(parts),
-        ))
+        (chapter_title, _dedupe_glyph_defs(XHTML_TEMPLATE.format(
+            title=_escape_text(chapter_title or title), body="\n".join(parts),
+        )))
         for chapter_title, parts in chapters
     ]
 
@@ -583,10 +651,13 @@ def _build_opf(
 """
 
 
-def _build_nav(title: str, chapter_titles: list[str]) -> str:
+def _build_nav(title: str, chapter_titles: list[tuple[int, str]]) -> str:
+    """chapter_titles is (file_index, title) — continuation files produced by
+    the MAX_CHAPTER_BYTES split have no entry, so a section that spans several
+    files still shows as one line in the TOC."""
     items = "\n    ".join(
         f'<li><a href="content/chapter_{i+1:03d}.xhtml">{_escape_text(ct)}</a></li>'
-        for i, ct in enumerate(chapter_titles)
+        for i, ct in chapter_titles
     )
     return f"""\
 <?xml version="1.0" encoding="utf-8"?>
@@ -605,12 +676,12 @@ def _build_nav(title: str, chapter_titles: list[str]) -> str:
 """
 
 
-def _build_ncx(title: str, uid: str, chapter_titles: list[str]) -> str:
+def _build_ncx(title: str, uid: str, chapter_titles: list[tuple[int, str]]) -> str:
     nav_points = "\n  ".join(
-        f'<navPoint id="navPoint{i+1}" playOrder="{i+1}">'
+        f'<navPoint id="navPoint{n}" playOrder="{n}">'
         f'<navLabel><text>{_escape_text(ct)}</text></navLabel>'
         f'<content src="content/chapter_{i+1:03d}.xhtml"/></navPoint>'
-        for i, ct in enumerate(chapter_titles)
+        for n, (i, ct) in enumerate(chapter_titles, start=1)
     )
     return f"""\
 <?xml version="1.0" encoding="utf-8"?>
@@ -709,7 +780,11 @@ def run(
         # fallbacks are collected as embedded images.
         fallback_images: dict[str, bytes] = {}
         titled_chapters = _document_to_chapters(document, title, bus, fallback_images)
-        chapter_titles = [t for t, _ in titled_chapters]
+        # Continuation files (title None) stay in the manifest and spine but
+        # out of the TOC — see MAX_CHAPTER_BYTES.
+        chapter_titles = [
+            (i, t) for i, (t, _) in enumerate(titled_chapters) if t is not None
+        ]
         chapters_xhtml = [x for _, x in titled_chapters]
 
         with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zf:
