@@ -31,13 +31,18 @@ BOOK_CSS = """\
     display: block;
     text-align: center;
     margin: 1em 0;
+    /* Reserves the equation number's column. A float is out of flow, so
+       text-align:center will not clear it — padding shifts the centring box
+       AND shrinks what max-width:100% resolves against, so the number's
+       space comes out of the equation's width budget instead of overlapping
+       it. Pair with the .eq-number span being emitted BEFORE the SVG. */
+    padding-right: 3em;
   }
   .eq-display svg {
     max-width: 100%;
   }
   .eq-number {
     float: right;
-    margin-right: 2em;
   }
   .eq-flagged {
     color: #cc0000;
@@ -53,8 +58,9 @@ BOOK_CSS = """\
 
 /* Fallback for non-Kindle EPUB readers */
 .eq-inline { display: inline-block; vertical-align: middle; }
-.eq-display { display: block; text-align: center; margin: 1em 0; }
+.eq-display { display: block; text-align: center; margin: 1em 0; padding-right: 3em; }
 .eq-display svg { max-width: 100%; }
+.eq-number { float: right; }
 .eq-flagged { color: #cc0000; font-family: monospace; border: 1px solid #cc0000; padding: 0 4px; }
 .eq-text { white-space: nowrap; }
 .eq-img-fallback { max-width: 100%; }
@@ -109,11 +115,7 @@ def _render_equation(
             )
             if region.formula_class == FormulaClass.INLINE:
                 return f'<span class="eq-inline">{img}</span>'
-            number_html = (
-                f'<span class="eq-number">{region.equation_number}</span>'
-                if region.equation_number else ""
-            )
-            return f'<div class="eq-display">{img}{number_html}</div>'
+            return f'<div class="eq-display">{_eq_number_html(region)}{img}</div>'
         return None
 
     svg = region.svg_postprocessed
@@ -121,10 +123,19 @@ def _render_equation(
     if region.formula_class == FormulaClass.INLINE:
         return f'<span class="eq-inline">{svg}</span>'
     else:
-        number_html = ""
-        if region.equation_number:
-            number_html = f'<span class="eq-number">{region.equation_number}</span>'
-        return f'<div class="eq-display">{svg}{number_html}</div>'
+        return f'<div class="eq-display">{_eq_number_html(region)}{svg}</div>'
+
+
+def _eq_number_html(region: EquationRegion) -> str:
+    """The equation-number span, or "" if the equation is unnumbered.
+
+    Emitted BEFORE the equation body: a right float can only sit beside
+    content that follows it, so a number placed after a wide centred SVG got
+    pushed against (or below) the equation. See .eq-display's padding-right.
+    """
+    if not region.equation_number:
+        return ""
+    return f'<span class="eq-number">{_escape_text(region.equation_number)}</span>'
 
 
 # Inline-equation placeholder embedded in TextBlock.raw_text by
@@ -135,6 +146,99 @@ _EMPTY_P_RE = re.compile(r'<p>\s*</p>')
 # A paragraph whose visible text ends in one of these is considered complete;
 # anything else at a page boundary is treated as a continuation and merged.
 _TERMINAL_TAIL_RE = re.compile(r'[.!?:;…"”\'’)\]]\s*$')
+
+# ── URL / DOI linkification ───────────────────────────────────────────────
+# Reference sections carry live URLs ("View online: https://doi.org/…") that
+# were reaching the EPUB as dead text. Matched against ALREADY-ESCAPED text:
+# a "&" in a query string arrives as "&amp;", which is exactly what an XHTML
+# href wants, and the other entities are handled in _linkify.
+_URL_RE = re.compile(
+    r'(?<![\w@.])('
+    r'https?://[^\s<>"]+'
+    r'|www\.[^\s<>"]+'
+    r'|doi:\s*10\.\d{4,}/[^\s<>"]+'
+    r'|10\.\d{4,}/[^\s<>"]+'
+    r')',
+    re.IGNORECASE,
+)
+# Sentence punctuation that follows a URL rather than belonging to it.
+_URL_TRAILING_RE = re.compile(r'[.,;:!?\'"]+$')
+_CLOSERS = {")": "(", "]": "[", "}": "{"}
+# Characters legal in the href we emit, checked after "&amp;" is folded back
+# to "&". Deliberately excludes "[" and "]" — legal only in a URI host, and
+# epubcheck rejects them in a path segment.
+_URL_SAFE_RE = re.compile(r"^[A-Za-z0-9\-._~:/?#@!$&'()*+,;=%]+$")
+
+
+def _trim_url(url: str) -> str:
+    """Peels off trailing characters that belong to the surrounding prose
+    rather than the address: sentence punctuation and unpaired closing
+    brackets. The two interleave — "…1811620]." needs the "." stripped before
+    the "]" becomes visible — so peel until stable."""
+    while url:
+        tm = _URL_TRAILING_RE.search(url)
+        if tm:
+            url = url[:tm.start()]
+            continue
+        last = url[-1]
+        opener = _CLOSERS.get(last)
+        if opener is not None and url.count(last) > url.count(opener):
+            url = url[:-1]
+            continue
+        break
+    return url
+
+
+def _linkify(escaped_text: str) -> str:
+    """Wraps bare URLs and DOIs in `escaped_text` in <a href>.
+
+    Must run on escaped text and BEFORE equation placeholders are substituted:
+    placeholders hold nothing URL-shaped, but the generated SVG/HTML markup
+    would otherwise be scanned (and mangled) by the URL pattern.
+
+    Anything that does not trim down to a clean URI is left as plain text.
+    epubcheck is fatal in this stage, so an over-eager match would fail the
+    whole build — real sources put URLs inside "[DOI: …]" and "<…>", and
+    citation text runs straight on after the closing bracket.
+
+    Known limitations: this is per-text-block, and runs before the cross-page
+    continuation merge in `_document_to_chapters`, so a URL split across a
+    column or page boundary yields two partial links. And the bare "10.xxxx/…"
+    form is a heuristic, unlike the three scheme-bearing forms — anything
+    DOI-shaped in running prose becomes a link. Worst case is a dead link, not
+    a broken build: _URL_SAFE_RE still guards the href.
+    """
+    def replace(match: "re.Match[str]") -> str:
+        url = match.group(1)
+        # The source may wrap a URL in angle brackets or quotes ("<http://…>"),
+        # which _escape_text has already turned into entities. Those end the
+        # URL — only &amp; may legitimately appear inside one.
+        for entity in ("&lt;", "&gt;", "&quot;"):
+            url = url.split(entity, 1)[0]
+
+        url = _trim_url(url)
+        if not url:
+            return match.group(0)
+
+        low = url.lower()
+        if low.startswith(("http://", "https://")):
+            href = url
+        elif low.startswith("www."):
+            href = f"http://{url}"
+        elif low.startswith("doi:"):
+            # "doi: 10.1119/…" — the visible label keeps its prefix and space,
+            # so the safety check below has to see the href, not the label.
+            href = f"https://doi.org/{url.split(':', 1)[1].strip()}"
+        else:
+            href = f"https://doi.org/{url}"
+
+        if not _URL_SAFE_RE.match(href.replace("&amp;", "&")):
+            return match.group(0)
+        # url is only ever truncated from the right, so the rest of the match
+        # is a clean suffix — re-emitted verbatim so no source text is dropped.
+        return f'<a href="{href}">{url}</a>{match.group(1)[len(url):]}'
+
+    return _URL_RE.sub(replace, escaped_text)
 
 
 def _valid_table_html(table_html: str) -> Optional[str]:
@@ -201,7 +305,7 @@ def _document_to_chapters(
                 continue
             order = block.reading_order_index if block.reading_order_index is not None else block.bbox.y0
             inner = _EQ_PLACEHOLDER_RE.sub(
-                _substitute_placeholder, _escape_text(block.raw_text)
+                _substitute_placeholder, _linkify(_escape_text(block.raw_text))
             )
             # Visible tail (placeholders stripped) decides merge behaviour.
             tail = _EQ_PLACEHOLDER_RE.sub("", block.raw_text).rstrip()

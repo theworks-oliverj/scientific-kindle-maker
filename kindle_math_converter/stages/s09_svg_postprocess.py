@@ -16,6 +16,8 @@ from ..models.enums import ErrorCode
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
 from ..observability.logger import get_logger
+# The pt→em divisor must be the size the wrapper actually rendered at.
+from .s06_validation import LATEX_BODY_PT
 
 log = get_logger("s09_svg_postprocess")
 
@@ -30,12 +32,13 @@ def strip_font_size_css(svg: str) -> str:
     return svg
 
 
-def set_em_dimensions(svg: str, body_font_size_pt: float = 10.0) -> str:
+def set_em_dimensions(svg: str, body_font_size_pt: float = LATEX_BODY_PT) -> str:
     """
     Converts the root SVG element's width and height from pt to em units.
     Also sets viewBox and vertical-align for inline equations.
 
-    body_font_size_pt: base font size of the document body in points.
+    body_font_size_pt: base font size of the document body in points — the
+    size the wrapper rendered at, so the result is 1em per body-text line.
     Formula: width_em = width_pt / body_font_size_pt
     """
     from lxml import etree  # type: ignore
@@ -127,7 +130,7 @@ def namespace_svg_ids(svg: str, prefix: str) -> str:
     return svg
 
 
-def postprocess_svg(svg: str, body_font_size_pt: float = 10.0, prefix: str | None = None) -> str:
+def postprocess_svg(svg: str, body_font_size_pt: float = LATEX_BODY_PT, prefix: str | None = None) -> str:
     svg = strip_font_size_css(svg)
     svg = set_em_dimensions(svg, body_font_size_pt)
     svg = apply_current_color(svg)
@@ -140,7 +143,7 @@ def postprocess_svg(svg: str, body_font_size_pt: float = 10.0, prefix: str | Non
 def run(
     document: Document,
     bus: EventBus,
-    body_font_size_pt: float = 10.0,
+    body_font_size_pt: float = LATEX_BODY_PT,
 ) -> tuple[Document, StageResult]:
     t0 = time.perf_counter()
     stage = "s09_svg_postprocess"

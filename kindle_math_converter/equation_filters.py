@@ -262,16 +262,23 @@ _TAG_RE = re.compile(r'\\tag\s*\{([^{}]*)\}')
 
 def extract_equation_tag(latex: str) -> tuple[str, Optional[str]]:
     """
-    Splits a \\tag{N} out of `latex` (MinerU emits display equations with
-    their printed number as "\\tag {N}"). Returns (latex_without_tag,
+    Splits every \\tag{N} out of `latex` (MinerU emits display equations with
+    their printed number as "\\tag {N}"). Returns (latex_without_tags,
     "(N)" or None). The number is re-attached typographically by s10 via
-    the .eq-number span, so the tag must not reach tectonic.
+    the .eq-number span, so no tag may reach tectonic.
+
+    ALL tags must go, not just the first: a multi-row array can carry one per
+    row, and a surviving \\tag does not error inside \\[...\\] — it silently
+    typesets the number at the *page* right margin, which balloons the
+    tight-bbox SVG (measured: a 28.7pt equation became a 207.7pt box) and
+    duplicates the number that s10 already renders.
+
+    Multiple numbers are joined ("(5), (6)") since one span carries them all.
     """
-    m = _TAG_RE.search(latex)
-    if not m:
-        return latex, None
-    number = m.group(1).strip()
-    stripped = (latex[:m.start()] + latex[m.end():]).strip()
-    if not number:
-        return stripped, None
-    return stripped, number if number.startswith("(") else f"({number})"
+    numbers = [
+        n if n.startswith("(") else f"({n})"
+        for n in (m.group(1).strip() for m in _TAG_RE.finditer(latex))
+        if n
+    ]
+    stripped = _TAG_RE.sub("", latex).strip()
+    return stripped, ", ".join(numbers) if numbers else None
