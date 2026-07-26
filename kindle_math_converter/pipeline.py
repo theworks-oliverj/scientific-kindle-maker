@@ -43,8 +43,9 @@ class PipelineConfig:
     # CDM thresholds
     cdm_pass_threshold: float = 0.88
     cdm_repair_threshold: float = 0.70
-    # Rendering
-    body_font_size_pt: float = 10.0
+    # Rendering — must match the LaTeX wrapper's \documentclass size, or
+    # equations stop matching the reader's body text size (see LATEX_BODY_PT).
+    body_font_size_pt: float = s06_validation.LATEX_BODY_PT
     tectonic_timeout_s: int = 45
     dvisvgm_timeout_s: int = 10
     max_repair_attempts: int = 2

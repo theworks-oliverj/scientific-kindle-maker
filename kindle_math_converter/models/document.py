@@ -69,6 +69,7 @@ class EquationRegion:
     is_reference_label: bool = False           # Set in Stage 5B: looks like a footnote/reference marker
     render_as_text: bool = False               # Set in Stage 5B: simple enough to render as HTML text
     inline_text_repr: Optional[str] = None     # Set in Stage 5B: HTML text repr when render_as_text
+    footnote_ref_id: Optional[str] = None      # Set in Stage 3: this "^{N}" marks footnote <id>, linked in s10
 
 
 @dataclass
@@ -78,7 +79,8 @@ class TextBlock:
     raw_text: str
     reading_order_index: float
     source_image_crop: Optional[bytes] = None  # Masked PNG crop (scanned src), set in Stage 3; OCR'd in Stage 5A
-    kind: str = "text"                         # "text" | "heading" | "list_item"
+    kind: str = "text"                         # "text" | "heading" | "list_item" | "footnote"
+    footnote_id: Optional[str] = None          # kind == "footnote": target id for its noteref anchor
 
 
 @dataclass

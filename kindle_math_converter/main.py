@@ -15,6 +15,7 @@ from rich.text import Text
 
 from .observability.logger import configure_logging
 from .pipeline import Pipeline, PipelineConfig
+from .stages.s06_validation import LATEX_BODY_PT
 
 console = Console()
 
@@ -57,8 +58,9 @@ def download_models_cmd() -> None:
               help="Show detailed per-equation logging in terminal.")
 @click.option("--cdm-threshold", default=0.88, show_default=True, type=float,
               help="CDM pass threshold (0–1).")
-@click.option("--font-size", default=10.0, show_default=True, type=float,
-              help="Body font size in pt for SVG em sizing.")
+@click.option("--font-size", default=LATEX_BODY_PT, show_default=True, type=float,
+              help="Body font size in pt for SVG em sizing — the size the "
+                   "LaTeX wrapper renders at, so equations match body text.")
 @click.option("--mathpix-id", default=None, envvar="MATHPIX_APP_ID",
               help="Mathpix App ID for fallback recognition.")
 @click.option("--mathpix-key", default=None, envvar="MATHPIX_APP_KEY",

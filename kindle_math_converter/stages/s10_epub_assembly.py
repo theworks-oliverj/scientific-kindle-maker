@@ -31,13 +31,18 @@ BOOK_CSS = """\
     display: block;
     text-align: center;
     margin: 1em 0;
+    /* Reserves the equation number's column. A float is out of flow, so
+       text-align:center will not clear it — padding shifts the centring box
+       AND shrinks what max-width:100% resolves against, so the number's
+       space comes out of the equation's width budget instead of overlapping
+       it. Pair with the .eq-number span being emitted BEFORE the SVG. */
+    padding-right: 3em;
   }
   .eq-display svg {
     max-width: 100%;
   }
   .eq-number {
     float: right;
-    margin-right: 2em;
   }
   .eq-flagged {
     color: #cc0000;
@@ -53,14 +58,23 @@ BOOK_CSS = """\
 
 /* Fallback for non-Kindle EPUB readers */
 .eq-inline { display: inline-block; vertical-align: middle; }
-.eq-display { display: block; text-align: center; margin: 1em 0; }
+.eq-display { display: block; text-align: center; margin: 1em 0; padding-right: 3em; }
 .eq-display svg { max-width: 100%; }
+.eq-number { float: right; }
 .eq-flagged { color: #cc0000; font-family: monospace; border: 1px solid #cc0000; padding: 0 4px; }
 .eq-text { white-space: nowrap; }
 .eq-img-fallback { max-width: 100%; }
 span.eq-inline img.eq-img-fallback { height: 1.2em; width: auto; vertical-align: middle; }
 .figure { text-align: center; margin: 1em 0; }
 .figure img { max-width: 100%; }
+
+/* Footnotes recovered from the page furniture, collected at the end of the
+   section holding their reference. Ordinary paragraphs on purpose — the
+   EPUB3 popup markup gets hidden by reading systems (see _footnote_html). */
+.footnotes { border-top: 1px solid currentColor; margin-top: 2em; padding-top: 0.5em; }
+.footnotes-title { font-size: 0.8em; font-weight: bold; margin: 0 0 0.4em 0; }
+.footnote { font-size: 0.85em; margin: 0.4em 0; text-indent: 0; }
+.footnote-back { text-decoration: none; }
 """
 
 XHTML_TEMPLATE = """\
@@ -95,7 +109,18 @@ def _render_equation(
     the EPUB) — for a reading tool, a raster equation beats a missing one.
     """
     if region.render_as_text:
-        return f'<span class="eq-text">{region.inline_text_repr}</span>'
+        span = f'<span class="eq-text">{region.inline_text_repr}</span>'
+        if region.footnote_ref_id:
+            # A plain link, not epub:type="noteref" — see _footnote_html for
+            # why the popup markup had to go. Tapping jumps to the note at the
+            # end of the section (always the same file), and the note links
+            # back here.
+            return (
+                f'<a class="noteref" '
+                f'id="{_noteref_anchor_id(region.footnote_ref_id)}" '
+                f'href="#{region.footnote_ref_id}">{span}</a>'
+            )
+        return span
 
     if region.is_reference_label:
         return None
@@ -109,11 +134,7 @@ def _render_equation(
             )
             if region.formula_class == FormulaClass.INLINE:
                 return f'<span class="eq-inline">{img}</span>'
-            number_html = (
-                f'<span class="eq-number">{region.equation_number}</span>'
-                if region.equation_number else ""
-            )
-            return f'<div class="eq-display">{img}{number_html}</div>'
+            return f'<div class="eq-display">{_eq_number_html(region)}{img}</div>'
         return None
 
     svg = region.svg_postprocessed
@@ -121,10 +142,49 @@ def _render_equation(
     if region.formula_class == FormulaClass.INLINE:
         return f'<span class="eq-inline">{svg}</span>'
     else:
-        number_html = ""
-        if region.equation_number:
-            number_html = f'<span class="eq-number">{region.equation_number}</span>'
-        return f'<div class="eq-display">{svg}{number_html}</div>'
+        return f'<div class="eq-display">{_eq_number_html(region)}{svg}</div>'
+
+
+def _noteref_anchor_id(footnote_id: str) -> str:
+    """Id of the in-text marker that points at `footnote_id` ("fn_2_1" ->
+    "fnref_2_1"), so the note can link back to where the reader was."""
+    return "fnref_" + footnote_id[3:] if footnote_id.startswith("fn_") else f"fnref_{footnote_id}"
+
+
+def _footnote_html(unit: dict, back_link: bool) -> str:
+    """One recovered footnote as an ordinary, always-visible paragraph.
+
+    Deliberately NOT <aside epub:type="footnote">. That is the EPUB3 markup
+    for popup notes, and reading systems that implement popups take the aside
+    out of the normal flow via their own stylesheet — so where the popup does
+    not fire, the note is simply invisible. Observed on both a desktop EPUB
+    reader and Kindle: all ten recovered notes silently disappeared. A plain
+    <p> cannot be hidden that way, and the marker/back-link pair still gives
+    two-way navigation everywhere.
+
+    `back_link` must only be True when the marker anchor is in the same
+    chapter file — an href="#…" with no target is a dangling fragment.
+    """
+    back = ""
+    if back_link and unit["footnote_id"]:
+        back = (
+            f' <a class="footnote-back" '
+            f'href="#{_noteref_anchor_id(unit["footnote_id"])}">↩</a>'
+        )
+    attrs = f' id="{unit["footnote_id"]}"' if unit["footnote_id"] else ""
+    return f'<p class="footnote"{attrs}>{unit["inner"]}{back}</p>'
+
+
+def _eq_number_html(region: EquationRegion) -> str:
+    """The equation-number span, or "" if the equation is unnumbered.
+
+    Emitted BEFORE the equation body: a right float can only sit beside
+    content that follows it, so a number placed after a wide centred SVG got
+    pushed against (or below) the equation. See .eq-display's padding-right.
+    """
+    if not region.equation_number:
+        return ""
+    return f'<span class="eq-number">{_escape_text(region.equation_number)}</span>'
 
 
 # Inline-equation placeholder embedded in TextBlock.raw_text by
@@ -132,9 +192,153 @@ def _render_equation(
 _EQ_PLACEHOLDER_RE = re.compile(r'\[\[EQ:([A-Za-z0-9_]+)\]\]')
 _EMPTY_P_RE = re.compile(r'<p>\s*</p>')
 
+# Kindle's publishing guidelines cap a single XHTML file at 300 KB. Measured
+# before the budget existed, and against dvisvgm's uncompressed outlines: the
+# SU3 paper produced a 505 KB section and a 229 KB one, and neither rendered
+# reliably on device — while a document whose largest file was 91 KB was
+# fine. The budget is checked before glyph dedup shrinks the file, so the
+# written files land well under the cap.
+MAX_CHAPTER_BYTES = 250_000
+# The footnote id an emitted in-text marker points at (see _render_equation).
+_NOTEREF_ID_RE = re.compile(r'<a class="noteref"[^>]*href="#(fn_[^"]+)"')
+
 # A paragraph whose visible text ends in one of these is considered complete;
 # anything else at a page boundary is treated as a continuation and merged.
 _TERMINAL_TAIL_RE = re.compile(r'[.!?:;…"”\'’)\]]\s*$')
+
+# ── URL / DOI linkification ───────────────────────────────────────────────
+# Reference sections carry live URLs ("View online: https://doi.org/…") that
+# were reaching the EPUB as dead text. Matched against ALREADY-ESCAPED text:
+# a "&" in a query string arrives as "&amp;", which is exactly what an XHTML
+# href wants, and the other entities are handled in _linkify.
+_URL_RE = re.compile(
+    r'(?<![\w@.])('
+    r'https?://[^\s<>"]+'
+    r'|www\.[^\s<>"]+'
+    r'|doi:\s*10\.\d{4,}/[^\s<>"]+'
+    r'|10\.\d{4,}/[^\s<>"]+'
+    r')',
+    re.IGNORECASE,
+)
+# Sentence punctuation that follows a URL rather than belonging to it.
+_URL_TRAILING_RE = re.compile(r'[.,;:!?\'"]+$')
+_CLOSERS = {")": "(", "]": "[", "}": "{"}
+# Characters legal in the href we emit, checked after "&amp;" is folded back
+# to "&". Deliberately excludes "[" and "]" — legal only in a URI host, and
+# epubcheck rejects them in a path segment.
+_URL_SAFE_RE = re.compile(r"^[A-Za-z0-9\-._~:/?#@!$&'()*+,;=%]+$")
+
+
+def _trim_url(url: str) -> str:
+    """Peels off trailing characters that belong to the surrounding prose
+    rather than the address: sentence punctuation and unpaired closing
+    brackets. The two interleave — "…1811620]." needs the "." stripped before
+    the "]" becomes visible — so peel until stable."""
+    while url:
+        tm = _URL_TRAILING_RE.search(url)
+        if tm:
+            url = url[:tm.start()]
+            continue
+        last = url[-1]
+        opener = _CLOSERS.get(last)
+        if opener is not None and url.count(last) > url.count(opener):
+            url = url[:-1]
+            continue
+        break
+    return url
+
+
+def _linkify(escaped_text: str) -> str:
+    """Wraps bare URLs and DOIs in `escaped_text` in <a href>.
+
+    Must run on escaped text and BEFORE equation placeholders are substituted:
+    placeholders hold nothing URL-shaped, but the generated SVG/HTML markup
+    would otherwise be scanned (and mangled) by the URL pattern.
+
+    Anything that does not trim down to a clean URI is left as plain text.
+    epubcheck is fatal in this stage, so an over-eager match would fail the
+    whole build — real sources put URLs inside "[DOI: …]" and "<…>", and
+    citation text runs straight on after the closing bracket.
+
+    Known limitations: this is per-text-block, and runs before the cross-page
+    continuation merge in `_document_to_chapters`, so a URL split across a
+    column or page boundary yields two partial links. And the bare "10.xxxx/…"
+    form is a heuristic, unlike the three scheme-bearing forms — anything
+    DOI-shaped in running prose becomes a link. Worst case is a dead link, not
+    a broken build: _URL_SAFE_RE still guards the href.
+    """
+    def replace(match: "re.Match[str]") -> str:
+        url = match.group(1)
+        # The source may wrap a URL in angle brackets or quotes ("<http://…>"),
+        # which _escape_text has already turned into entities. Those end the
+        # URL — only &amp; may legitimately appear inside one.
+        for entity in ("&lt;", "&gt;", "&quot;"):
+            url = url.split(entity, 1)[0]
+
+        url = _trim_url(url)
+        if not url:
+            return match.group(0)
+
+        low = url.lower()
+        if low.startswith(("http://", "https://")):
+            href = url
+        elif low.startswith("www."):
+            href = f"http://{url}"
+        elif low.startswith("doi:"):
+            # "doi: 10.1119/…" — the visible label keeps its prefix and space,
+            # so the safety check below has to see the href, not the label.
+            href = f"https://doi.org/{url.split(':', 1)[1].strip()}"
+        else:
+            href = f"https://doi.org/{url}"
+
+        if not _URL_SAFE_RE.match(href.replace("&amp;", "&")):
+            return match.group(0)
+        # url is only ever truncated from the right, so the rest of the match
+        # is a clean suffix — re-emitted verbatim so no source text is dropped.
+        return f'<a href="{href}">{url}</a>{match.group(1)[len(url):]}'
+
+    return _URL_RE.sub(replace, escaped_text)
+
+
+# dvisvgm emits one <path id="…" d="…"/> glyph definition per equation, and
+# s09 namespaces those ids per region so they stay unique when many equations
+# share an XHTML file. The letter "S" therefore gets re-embedded in full for
+# every equation that uses it — 80% of a maths-heavy chapter turned out to be
+# duplicated outline data (638 defs for 227 distinct shapes in one chapter).
+_GLYPH_DEF_RE = re.compile(r'<path id="([^"]+)" d="([^"]+)"/>')
+
+
+def _dedupe_glyph_defs(xhtml: str) -> str:
+    """Collapses identical glyph outlines within one XHTML file to a single
+    definition, repointing every <use> at the survivor.
+
+    Keyed on the outline data, never on the id: dvisvgm numbers glyphs
+    per-render, so the same id means different shapes in different equations
+    (42 such collisions in one chapter here). That is exactly why s09
+    namespaces them, and why this must not simply strip the namespace.
+    """
+    canonical_by_outline: dict[str, str] = {}
+    alias: dict[str, str] = {}
+
+    def keep_first(match: "re.Match[str]") -> str:
+        glyph_id, outline = match.group(1), match.group(2)
+        first = canonical_by_outline.get(outline)
+        if first is None:
+            canonical_by_outline[outline] = glyph_id
+            return match.group(0)
+        alias[glyph_id] = first
+        return ""
+
+    xhtml = _GLYPH_DEF_RE.sub(keep_first, xhtml)
+    if not alias:
+        return xhtml
+    # Only <use href="#glyph"> can name these ids; footnote anchors are never
+    # in the map, so they pass through untouched.
+    return re.sub(
+        r'href="#([^"]+)"',
+        lambda m: f'href="#{alias.get(m.group(1), m.group(1))}"',
+        xhtml,
+    )
 
 
 def _valid_table_html(table_html: str) -> Optional[str]:
@@ -156,7 +360,7 @@ def _document_to_chapters(
     title: str,
     bus: EventBus,
     embedded_images: dict[str, bytes],
-) -> list[tuple[str, str]]:
+) -> list[tuple[Optional[str], str]]:
     """
     Assembles the whole document into section chapters:
 
@@ -193,6 +397,11 @@ def _document_to_chapters(
 
     # ── Pass 1: per-page reading-order units ────────────────────────────
     units: list[dict] = []
+    # Footnotes are held out of the reading-order stream entirely and placed
+    # by Pass 3 at the end of the section holding their reference. Leaving
+    # them inline would drop a block between a page's last paragraph and the
+    # next page's first, breaking the cross-page continuation merge below.
+    footnotes: list[dict] = []
     for page in document.pages:
         page_items: list[tuple[float, float, dict]] = []
 
@@ -201,10 +410,16 @@ def _document_to_chapters(
                 continue
             order = block.reading_order_index if block.reading_order_index is not None else block.bbox.y0
             inner = _EQ_PLACEHOLDER_RE.sub(
-                _substitute_placeholder, _escape_text(block.raw_text)
+                _substitute_placeholder, _linkify(_escape_text(block.raw_text))
             )
             # Visible tail (placeholders stripped) decides merge behaviour.
             tail = _EQ_PLACEHOLDER_RE.sub("", block.raw_text).rstrip()
+            if block.kind == "footnote":
+                footnotes.append({
+                    "footnote_id": block.footnote_id, "inner": inner,
+                    "page": page.page_number,
+                })
+                continue
             page_items.append((order, block.bbox.y0, {
                 "kind": block.kind, "inner": inner, "tail": tail,
                 "page": page.page_number,
@@ -273,16 +488,82 @@ def _document_to_chapters(
             continue
         merged.append(unit)
 
-    # ── Pass 3: split into chapters at headings ─────────────────────────
-    chapters: list[tuple[str, list[str]]] = []
-    current_title = title
+    # ── Pass 3: split into chapters at headings, footnotes at section end ─
+    # `title` is None for a continuation file — same section, split only
+    # because it outgrew MAX_CHAPTER_BYTES, and so kept out of the TOC.
+    chapters: list[tuple[Optional[str], list[str]]] = []
+    current_title: Optional[str] = title
     current_parts: list[str] = []
+    current_bytes = 0
+    pending_notes = list(footnotes)      # document order, drained as placed
+    linked_note_ids = {
+        r.footnote_ref_id for r in document.all_equations if r.footnote_ref_id
+    }
+    refs_in_chapter: set[str] = set()    # note ids whose marker appeared here
+    max_page_in_chapter = 0
 
-    def _flush() -> None:
-        nonlocal current_parts
-        if current_parts:
-            chapters.append((current_title, current_parts))
+    def _place_notes(final: bool = False) -> list[str]:
+        """Notes owed by the section just closed.
+
+        A linked note goes with the section holding its reference marker, so
+        the popup link and its back-link stay inside one file — it waits for
+        that marker however many sections that takes. An unlinked note has no
+        anchor to chase, so it waits until a section has moved past its page
+        (strictly: contains content from a later one), which is the point its
+        page is known to be finished.
+
+        Placing a linked note early would strand it in a different file from
+        its marker, which is a dangling fragment and an epubcheck error.
+        """
+        nonlocal pending_notes
+        due, keep = [], []
+        for note in pending_notes:
+            linked = note["footnote_id"] in linked_note_ids
+            owed = final or (
+                note["footnote_id"] in refs_in_chapter if linked
+                else note["page"] < max_page_in_chapter
+            )
+            (due if owed else keep).append(note)
+        pending_notes = keep
+        if not due:
+            return []
+        return [
+            '<div class="footnotes"><p class="footnotes-title">Notes</p>'
+            + "".join(
+                _footnote_html(note, back_link=note["footnote_id"] in refs_in_chapter)
+                for note in due
+            )
+            + "</div>"
+        ]
+
+    def _flush(final: bool = False, split: bool = False) -> None:
+        """Closes the current XHTML file. `split` means the section continues
+        in the next file, so its notes-so-far are settled here (their markers
+        are in THIS file) and the next file carries no TOC entry."""
+        nonlocal current_parts, current_bytes, refs_in_chapter
+        nonlocal max_page_in_chapter, current_title
+        notes = _place_notes(final) if (current_parts or final) else []
+        if current_parts or notes:
+            chapters.append((current_title, current_parts + notes))
+        if split:
+            current_title = None
         current_parts = []
+        current_bytes = 0
+        refs_in_chapter = set()
+        max_page_in_chapter = 0
+
+    def _emit(part: str, page: int) -> None:
+        nonlocal max_page_in_chapter, current_bytes
+        current_parts.append(part)
+        current_bytes += len(part)
+        max_page_in_chapter = max(max_page_in_chapter, page)
+        refs_in_chapter.update(_NOTEREF_ID_RE.findall(part))
+        # Kindle's publishing guidelines cap one XHTML file at 300 KB, and a
+        # maths-heavy section blows past that on inline SVG alone (505 KB
+        # observed) — the whole file then renders unreliably on device. Break
+        # between units so no paragraph or equation is ever split.
+        if current_bytes > MAX_CHAPTER_BYTES:
+            _flush(split=True)
 
     for unit in merged:
         if unit["kind"] == "heading":
@@ -293,20 +574,22 @@ def _document_to_chapters(
             # Headings hold at most inline math — strip any paragraph-split
             # artifacts a display placeholder would have produced.
             heading_inner = unit["inner"].replace("</p>", "").replace("<p>", "")
-            current_parts.append(f"<h2>{heading_inner}</h2>")
+            _emit(f"<h2>{heading_inner}</h2>", unit["page"])
         elif unit.get("inner") is not None:
-            current_parts.append(_EMPTY_P_RE.sub("", f'<p>{unit["inner"]}</p>'))
+            _emit(_EMPTY_P_RE.sub("", f'<p>{unit["inner"]}</p>'), unit["page"])
         else:
-            current_parts.append(unit["html"])
-    _flush()
+            _emit(unit["html"], unit["page"])
+    _flush(final=True)
 
     if not chapters:
         chapters = [(title, ["<p>&#160;</p>"])]
 
+    # Glyph dedup is per FILE, so it runs after the split above has decided
+    # where the file boundaries are.
     return [
-        (chapter_title, XHTML_TEMPLATE.format(
-            title=_escape_text(chapter_title), body="\n".join(parts),
-        ))
+        (chapter_title, _dedupe_glyph_defs(XHTML_TEMPLATE.format(
+            title=_escape_text(chapter_title or title), body="\n".join(parts),
+        )))
         for chapter_title, parts in chapters
     ]
 
@@ -368,10 +651,13 @@ def _build_opf(
 """
 
 
-def _build_nav(title: str, chapter_titles: list[str]) -> str:
+def _build_nav(title: str, chapter_titles: list[tuple[int, str]]) -> str:
+    """chapter_titles is (file_index, title) — continuation files produced by
+    the MAX_CHAPTER_BYTES split have no entry, so a section that spans several
+    files still shows as one line in the TOC."""
     items = "\n    ".join(
         f'<li><a href="content/chapter_{i+1:03d}.xhtml">{_escape_text(ct)}</a></li>'
-        for i, ct in enumerate(chapter_titles)
+        for i, ct in chapter_titles
     )
     return f"""\
 <?xml version="1.0" encoding="utf-8"?>
@@ -390,12 +676,12 @@ def _build_nav(title: str, chapter_titles: list[str]) -> str:
 """
 
 
-def _build_ncx(title: str, uid: str, chapter_titles: list[str]) -> str:
+def _build_ncx(title: str, uid: str, chapter_titles: list[tuple[int, str]]) -> str:
     nav_points = "\n  ".join(
-        f'<navPoint id="navPoint{i+1}" playOrder="{i+1}">'
+        f'<navPoint id="navPoint{n}" playOrder="{n}">'
         f'<navLabel><text>{_escape_text(ct)}</text></navLabel>'
         f'<content src="content/chapter_{i+1:03d}.xhtml"/></navPoint>'
-        for i, ct in enumerate(chapter_titles)
+        for n, (i, ct) in enumerate(chapter_titles, start=1)
     )
     return f"""\
 <?xml version="1.0" encoding="utf-8"?>
@@ -494,7 +780,11 @@ def run(
         # fallbacks are collected as embedded images.
         fallback_images: dict[str, bytes] = {}
         titled_chapters = _document_to_chapters(document, title, bus, fallback_images)
-        chapter_titles = [t for t, _ in titled_chapters]
+        # Continuation files (title None) stay in the manifest and spine but
+        # out of the TOC — see MAX_CHAPTER_BYTES.
+        chapter_titles = [
+            (i, t) for i, (t, _) in enumerate(titled_chapters) if t is not None
+        ]
         chapters_xhtml = [x for _, x in titled_chapters]
 
         with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zf:

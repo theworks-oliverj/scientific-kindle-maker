@@ -82,6 +82,23 @@ def _apply_unicode_substitutions(latex: str) -> str:
     return latex
 
 
+# A row break immediately followed by "[" is read by LaTeX as the optional
+# vertical-space form \\[<dimen>], so "\\ [ A, B ] = 0" fails with "Missing
+# number, treated as zero". MinerU emits exactly this shape for multi-line
+# commutator relations (\begin{array}{l} ... \\ [ H_1, H_2 ] = 0 ...).
+# Inserting an empty group makes the "[" ordinary again.
+#
+# The negative lookahead spares a REAL \\[<dimen>] (e.g. "\\[2pt]"), which
+# EPUB/MathML sources do emit — bracing that would typeset a literal "[2pt]".
+_ROW_BREAK_BRACKET_RE = re.compile(
+    r"(\\\\)(\s*)\[(?!\s*-?[\d.]+\s*(?:pt|em|ex|mm|cm|in|bp|pc|dd|cc|sp|mu)\s*\])"
+)
+
+
+def _fix_row_break_bracket(latex: str) -> str:
+    return _ROW_BREAK_BRACKET_RE.sub(r"\1\2{}[", latex)
+
+
 # ---------------------------------------------------------------------------
 # Tier 2 — Structural regex repair rules
 # Applied after Tier 1. Order matters: subscript/superscript rules last.
@@ -100,6 +117,9 @@ REPAIR_RULES: list[tuple[str | re.Pattern, str | Callable]] = [
     (r"\{\\Lambda\}",              r"{\\lambda}"),  # Λ inside braces → λ
     (r"\\Eta\b",                   r"\\eta"),
     (r"\\Nu\b",                    r"\\nu"),
+    # Row break followed by "[": see _fix_row_break_bracket. Kept here too so
+    # the repair loop still heals it if a later rule ever re-introduces it.
+    (_ROW_BREAK_BRACKET_RE,   r"\1\2{}["),
     # Decorated letters — normalize spacing
     (r"\\vec\s*\{([^}]+)\}",  r"\\vec{\1}"),
     (r"\\hat\s*\{([^}]+)\}",  r"\\hat{\1}"),
@@ -145,6 +165,26 @@ _CMD_TO_PKG: dict[str, str] = {
 }
 _BASE_PACKAGES = "amsmath,amssymb,amsfonts,physics"
 
+# Body font size the wrapper renders at. Stage 9 divides the SVG's pt
+# dimensions by this to get em, so 1em == one body-text line — keep the two
+# in lockstep or equations stop matching the reader's font size.
+# article only accepts 10, 11 or 12 as the \documentclass size.
+LATEX_BODY_PT = 12.0
+
+# Force Computer Modern for text-mode glyphs.
+#
+# tectonic's default bundle maps the roman family to Latin Modern, which ships
+# only as .otf. dvisvgm cannot embed those (no psfonts.map, no lm*.pfb in the
+# bundle cache), so ANY equation containing \text{...} died with
+# "ERROR: failed to release font" and fell back to a raster crop. cmr12.pfb IS
+# in the bundle, and _dvisvgm_env() already puts that directory on TEXFONTS.
+#
+# Both halves are needed: [OT1]{fontenc} alone still asks for lmr12.pfb (glyphs
+# silently dropped); \rmdefault alone leaves the OT1->LM mapping in place.
+# The bundle has no ec*.pfb, so T1 is not an option — meaning non-ASCII inside
+# \text{} may still fail, which degrades to the existing raster fallback.
+_FONT_PREAMBLE = "\\usepackage[OT1]{fontenc}\\renewcommand{\\rmdefault}{cmr}"
+
 
 def _build_latex_wrapper(latex: str, formula_class: FormulaClass) -> str:
     extra: set[str] = set()
@@ -154,8 +194,9 @@ def _build_latex_wrapper(latex: str, formula_class: FormulaClass) -> str:
     pkg_line = _BASE_PACKAGES + ("," + ",".join(sorted(extra)) if extra else "")
     body = f"\\[\n{latex}\n\\]" if formula_class == FormulaClass.DISPLAY else f"${latex}$"
     return (
-        f"\\documentclass[12pt]{{article}}\n"
+        f"\\documentclass[{LATEX_BODY_PT:g}pt]{{article}}\n"
         f"\\usepackage{{{pkg_line}}}\n"
+        f"{_FONT_PREAMBLE}\n"
         f"\\pagestyle{{empty}}\n"
         f"\\begin{{document}}\n"
         f"{body}\n"
@@ -441,6 +482,7 @@ def normalize_latex(latex: str) -> str:
     # A negative lookbehind keeps escaped \% (literal percent) intact —
     # without it "50\%" normalizes to "50\" and fails to compile.
     latex = re.sub(r"(?<!\\)%[^\n]*", "", latex)
+    latex = _fix_row_break_bracket(latex)
     latex = re.sub(r"\s+", " ", latex).strip()
     latex = re.sub(r"\s*\^\s*", "^", latex)
     latex = re.sub(r"\s*_\s*", "_", latex)
@@ -492,7 +534,10 @@ def _validate_region(
         return {"counter": "fallback", "warning": None, "event": None}
 
     # ── Tier 1: Unicode → LaTeX (always, before any compile attempt) ─
-    latex = _apply_unicode_substitutions(region.raw_latex)
+    # The row-break fix runs here too, not just in the repair loop: without it
+    # the first compile fails outright and the equation burns repair attempts
+    # on a problem that has one deterministic answer.
+    latex = _fix_row_break_bracket(_apply_unicode_substitutions(region.raw_latex))
 
     # ── TRACK B — scanned source ─────────────────────────────────────
     if is_scanned:
