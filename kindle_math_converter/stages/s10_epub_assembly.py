@@ -193,12 +193,20 @@ _EQ_PLACEHOLDER_RE = re.compile(r'\[\[EQ:([A-Za-z0-9_]+)\]\]')
 _EMPTY_P_RE = re.compile(r'<p>\s*</p>')
 
 # Kindle's publishing guidelines cap a single XHTML file at 300 KB. Measured
-# before the budget existed, and against dvisvgm's uncompressed outlines: the
-# SU3 paper produced a 505 KB section and a 229 KB one, and neither rendered
-# reliably on device — while a document whose largest file was 91 KB was
-# fine. The budget is checked before glyph dedup shrinks the file, so the
-# written files land well under the cap.
-MAX_CHAPTER_BYTES = 250_000
+# against dvisvgm's uncompressed outlines: the SU3 paper produced a 505 KB
+# section and a 229 KB one, and neither rendered reliably on device — while a
+# document whose largest file was 91 KB was fine.
+#
+# Splitting is the ONLY lever here. Sharing repeated glyph outlines between
+# equations would cut a maths-heavy file by more than half, but it requires
+# <use> to reach into another <svg> element, which Kindle does not resolve —
+# see _svgs_referencing_outside_themselves. Cutting per-equation SVG size has
+# to happen upstream (one dvisvgm pass per group of equations), not here.
+KINDLE_MAX_FILE_BYTES = 300_000
+# Headroom below the hard cap: the notes block is appended at flush time,
+# after the budget has already been checked, so the ceiling has to leave room
+# for a section's worth of footnotes plus the template.
+MAX_CHAPTER_BYTES = 220_000
 # The footnote id an emitted in-text marker points at (see _render_equation).
 _NOTEREF_ID_RE = re.compile(r'<a class="noteref"[^>]*href="#(fn_[^"]+)"')
 
@@ -300,45 +308,26 @@ def _linkify(escaped_text: str) -> str:
     return _URL_RE.sub(replace, escaped_text)
 
 
-# dvisvgm emits one <path id="…" d="…"/> glyph definition per equation, and
-# s09 namespaces those ids per region so they stay unique when many equations
-# share an XHTML file. The letter "S" therefore gets re-embedded in full for
-# every equation that uses it — 80% of a maths-heavy chapter turned out to be
-# duplicated outline data (638 defs for 227 distinct shapes in one chapter).
-_GLYPH_DEF_RE = re.compile(r'<path id="([^"]+)" d="([^"]+)"/>')
+_SVG_ELEMENT_RE = re.compile(r'<svg\b.*?</svg>', re.S)
 
 
-def _dedupe_glyph_defs(xhtml: str) -> str:
-    """Collapses identical glyph outlines within one XHTML file to a single
-    definition, repointing every <use> at the survivor.
+def _svgs_referencing_outside_themselves(xhtml: str) -> list[str]:
+    """Ids that a <use> names but that are not defined inside the same <svg>.
 
-    Keyed on the outline data, never on the id: dvisvgm numbers glyphs
-    per-render, so the same id means different shapes in different equations
-    (42 such collisions in one chapter here). That is exactly why s09
-    namespaces them, and why this must not simply strip the namespace.
+    Every equation SVG must be self-contained. dvisvgm emits each glyph as a
+    <path id="…"> in that SVG's own <defs>, drawn by <use href="#…">, and a
+    cross-<svg> reference is not resolved by Kindle — the glyph silently
+    renders as nothing, leaving a partially drawn equation. epubcheck does not
+    catch this (the ids do exist, just in the wrong element), which is how a
+    file-wide glyph dedup shipped and broke the first equations of a chapter.
     """
-    canonical_by_outline: dict[str, str] = {}
-    alias: dict[str, str] = {}
-
-    def keep_first(match: "re.Match[str]") -> str:
-        glyph_id, outline = match.group(1), match.group(2)
-        first = canonical_by_outline.get(outline)
-        if first is None:
-            canonical_by_outline[outline] = glyph_id
-            return match.group(0)
-        alias[glyph_id] = first
-        return ""
-
-    xhtml = _GLYPH_DEF_RE.sub(keep_first, xhtml)
-    if not alias:
-        return xhtml
-    # Only <use href="#glyph"> can name these ids; footnote anchors are never
-    # in the map, so they pass through untouched.
-    return re.sub(
-        r'href="#([^"]+)"',
-        lambda m: f'href="#{alias.get(m.group(1), m.group(1))}"',
-        xhtml,
-    )
+    orphans: list[str] = []
+    for match in _SVG_ELEMENT_RE.finditer(xhtml):
+        block = match.group(0)
+        defined = set(re.findall(r'<path id="([^"]+)"', block))
+        used = set(re.findall(r'href="#([^"]+)"', block))
+        orphans.extend(sorted(used - defined))
+    return orphans
 
 
 def _valid_table_html(table_html: str) -> Optional[str]:
@@ -554,16 +543,15 @@ def _document_to_chapters(
 
     def _emit(part: str, page: int) -> None:
         nonlocal max_page_in_chapter, current_bytes
+        # Close the file BEFORE the unit that would overflow it, so the budget
+        # is a real ceiling rather than one oversized equation past it. Breaks
+        # only between units, so no paragraph or equation is ever cut.
+        if current_parts and current_bytes + len(part) > MAX_CHAPTER_BYTES:
+            _flush(split=True)
         current_parts.append(part)
         current_bytes += len(part)
         max_page_in_chapter = max(max_page_in_chapter, page)
         refs_in_chapter.update(_NOTEREF_ID_RE.findall(part))
-        # Kindle's publishing guidelines cap one XHTML file at 300 KB, and a
-        # maths-heavy section blows past that on inline SVG alone (505 KB
-        # observed) — the whole file then renders unreliably on device. Break
-        # between units so no paragraph or equation is ever split.
-        if current_bytes > MAX_CHAPTER_BYTES:
-            _flush(split=True)
 
     for unit in merged:
         if unit["kind"] == "heading":
@@ -584,12 +572,10 @@ def _document_to_chapters(
     if not chapters:
         chapters = [(title, ["<p>&#160;</p>"])]
 
-    # Glyph dedup is per FILE, so it runs after the split above has decided
-    # where the file boundaries are.
     return [
-        (chapter_title, _dedupe_glyph_defs(XHTML_TEMPLATE.format(
+        (chapter_title, XHTML_TEMPLATE.format(
             title=_escape_text(chapter_title or title), body="\n".join(parts),
-        )))
+        ))
         for chapter_title, parts in chapters
     ]
 
@@ -786,6 +772,31 @@ def run(
             (i, t) for i, (t, _) in enumerate(titled_chapters) if t is not None
         ]
         chapters_xhtml = [x for _, x in titled_chapters]
+
+        # Guard the two silent-corruption classes epubcheck cannot see: a
+        # glyph referenced across <svg> elements, and a file over Kindle's
+        # 300 KB ceiling. Both render as missing content on device only.
+        for i, xhtml in enumerate(chapters_xhtml):
+            orphans = _svgs_referencing_outside_themselves(xhtml)
+            if orphans:
+                msg = (f"chapter_{i+1:03d}: {len(orphans)} glyph(s) referenced "
+                       f"across <svg> elements, will not render on Kindle "
+                       f"(first: {orphans[:3]})")
+                errors.append(msg)
+                log.error("svg_cross_reference", chapter=i + 1, count=len(orphans))
+            size = len(xhtml.encode("utf-8"))
+            if size > KINDLE_MAX_FILE_BYTES:
+                warnings.append(
+                    f"chapter_{i+1:03d}: {size/1024:.0f} KB exceeds Kindle's "
+                    f"{KINDLE_MAX_FILE_BYTES//1024} KB per-file limit"
+                )
+                log.warning("chapter_oversized", chapter=i + 1, bytes=size)
+        if errors:
+            return output_path, StageResult(
+                stage_name=stage, ok=False,
+                duration_ms=round((time.perf_counter() - t0) * 1000, 2),
+                warnings=warnings, errors=errors,
+            )
 
         with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zf:
             # mimetype must be first and uncompressed
