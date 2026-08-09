@@ -129,13 +129,6 @@ def compare_snapshots_cmd(baseline: str, candidate: str, max_examples: int,
                    "parse, so a failed run resumes from the last completed "
                    "batch instead of restarting. 0 parses the whole document "
                    "in one go.")
-@click.option("--mineru-backend", default="vlm-engine", show_default=True,
-              help="MinerU backend: vlm-engine | hybrid-engine | pipeline. "
-                   "Changing this changes recognition — diff the run's "
-                   "_latex_snapshot.json with compare-snapshots before trusting it.")
-@click.option("--mineru-arg", "mineru_args", multiple=True,
-              help="Extra flag passed straight to the mineru CLI. Repeatable, "
-                   "e.g. --mineru-arg --effort --mineru-arg medium")
 @click.option("--mineru-timeout", default=None, type=int,
               help="Per-batch MinerU timeout in seconds. Default derives it "
                    "from the batch's page count (120 s/page, 600 s floor).")
@@ -153,8 +146,6 @@ def main(
     fresh_parse: bool,
     max_parallel_workers: int | None,
     parse_batch_size: int,
-    mineru_backend: str,
-    mineru_args: tuple[str, ...],
     mineru_timeout: int | None,
 ) -> None:
     """
@@ -189,8 +180,6 @@ def main(
         max_parallel_workers=max_parallel_workers,
         mineru_batch_size=parse_batch_size,
         mineru_timeout_s=mineru_timeout,
-        mineru_backend=mineru_backend,
-        mineru_extra_args=list(mineru_args),
     )
 
     console.print(f"\n[bold]Kindle Math Converter[/bold]")

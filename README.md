@@ -11,6 +11,8 @@ correctly rendered mathematical equations as scalable vector graphics (SVG).
 2. [System requirements](#2-system-requirements)
 3. [Installation](#3-installation)
 4. [Usage](#4-usage)
+   - [Long documents (100+ pages)](#4b-long-documents-100-pages)
+   - [Verifying a parser change](#verifying-a-parser-change)
 5. [Understanding the output files](#5-understanding-the-output-files)
 6. [Configuration reference](#6-configuration-reference)
 7. [The pipeline — what happens inside](#7-the-pipeline--what-happens-inside)
@@ -27,10 +29,14 @@ can't display.
 
 This tool does four things differently:
 
-1. **Detects** every equation on every page using a trained AI model (YOLOv8-MFD).
-2. **Recognises** each equation as LaTeX using another AI model (pix2tex).
-3. **Validates** the result by compiling the LaTeX and comparing the rendered output
-   to the original — equations that look wrong get a repair attempt.
+1. **Reads** each page with a document vision-language model (MinerU), which
+   recovers layout, reading order, text and equations in a single pass — including
+   multi-column flow, headings, tables and footnotes.
+2. **Recognises** every equation as LaTeX, inline ones included, keeping them in
+   place inside their sentences rather than pulling them out as images.
+3. **Validates** each equation by compiling it, and scores how plausible the
+   recognised LaTeX is — equations that fail get a repair attempt, and anything
+   still failing falls back to the page image rather than silently vanishing.
 4. **Renders** each equation to SVG using a real LaTeX engine (tectonic + dvisvgm),
    and embeds it inline in the EPUB — so equations scale with font size, respect
    dark mode, and never appear blurry.
@@ -171,15 +177,26 @@ python main.py convert paper.pdf --no-epubcheck
 python main.py convert --help
 
 Options:
-  --output-dir PATH       Output directory.              [default: ./output]
-  --verbose               Detailed per-equation logging in terminal.
-  --cdm-threshold FLOAT   Quality pass threshold (0–1).  [default: 0.88]
-  --font-size FLOAT       Body font size in pt.          [default: 10.0]
-  --mathpix-id TEXT       Mathpix App ID (optional fallback recogniser).
-  --mathpix-key TEXT      Mathpix App Key.
-  --open-report           Open HTML report in browser on completion.
-  --dump-cache            Write cache contents to JSON for debugging.
-  --no-epubcheck          Skip EPUB validation (if Java unavailable).
+  --output-dir PATH           Output directory.              [default: ./output]
+  --verbose                   Detailed per-equation logging in terminal.
+  --cdm-threshold FLOAT       Quality pass threshold (0–1).  [default: 0.88]
+  --font-size FLOAT           Body font size in pt.          [default: 12.0]
+  --mathpix-id TEXT           Mathpix App ID (optional fallback recogniser).
+  --mathpix-key TEXT          Mathpix App Key.
+  --open-report               Open HTML report in browser on completion.
+  --dump-cache                Write cache contents to JSON for debugging.
+  --no-epubcheck              Skip EPUB validation (if Java unavailable).
+  --fresh-parse               Re-run MinerU even if a cached parse exists.
+  --max-parallel-workers INT  Threads for per-equation work. [default: min(8, cpus)]
+  --parse-batch-size INT      Pages per MinerU invocation.   [default: 50]
+  --mineru-timeout INT        Per-batch timeout in seconds.  [default: derived]
+```
+
+There is also a second command for comparing runs — see
+[Verifying a parser change](#verifying-a-parser-change):
+
+```
+python main.py compare-snapshots BASELINE.json CANDIDATE.json
 ```
 
 ### Re-download models
@@ -215,9 +232,71 @@ If any equations are flagged:
 
 ---
 
+## 4b. Long documents (100+ pages)
+
+MinerU is roughly 86% of a short run's wall clock and ~95% of a long one, at a
+measured **45 seconds per page**. A 500-page textbook is therefore a 6–7 hour
+parse. Three things make that survivable rather than merely slow.
+
+**The parse runs in batches and resumes.** Pages are parsed
+`--parse-batch-size` at a time (default 50), each batch into its own directory
+under `<output>/mineru/batch_XXXXX_XXXXX/` with its own cached result. If a run
+dies at page 480, re-running it reuses every completed batch and only redoes the
+one that failed — minutes lost instead of hours. Nothing special is needed to
+resume: just run the same command again.
+
+**Timeouts scale with the work.** Each batch gets `pages × 120s` (minimum 600s)
+rather than one fixed cap, because a 6-page paper and a 500-page textbook cannot
+share a sensible constant. Override with `--mineru-timeout` if you need to.
+
+**Memory is bounded by batch size, not book length.** Page rasters are written
+to a temp directory and encoded one at a time, and each page's raster is
+released as soon as its equation crops are cut. Peak resident memory on a
+500-page book is ~0.44 GB. (Before this was measured and fixed it was 6.64 GB,
+which does not fit on a 16 GB machine.)
+
+A practical note: iterating on a long book is much cheaper than the first run.
+Successful LaTeX compiles are cached in `<output>/.compile_cache/`, so a second
+run of the same book skips the equation work entirely — measured at 79s → 14s on
+the 6-page reference paper.
+
+### Verifying a parser change
+
+Every run writes `{title}_latex_snapshot.json` containing the recognised LaTeX
+for every equation. `compare-snapshots` diffs two of them exactly:
+
+```bash
+python main.py compare-snapshots old/book_latex_snapshot.json new/book_latex_snapshot.json
+```
+
+Exit code 0 means recognition is unchanged; 1 means review it before accepting.
+
+**This exists because equation counts are not a sufficient check.** The quality
+gate is "does it compile, and does it look plausible" — so an equation that is
+recognised *wrongly* but still compiles passes silently, and at a thousand
+equations nobody finds it by reading. Two optimisations were measured against
+this harness and both were rejected despite being faster and producing zero
+flagged equations and a clean EPUBCheck:
+
+| Change | Speed | What the diff found |
+|---|---|---|
+| `-b hybrid-engine --effort medium` | 15% faster | 37% of equations changed. `SU_{3}` became `^{3}`; footnote markers shifted by one. |
+| 8-bit MLX quantization of the model | 21% faster | 3% changed — including a commutator `\left[ … \right]` turned into a ceiling function `\lceil … \rceil`. |
+
+A third, `--image-analysis false`, left recognition identical but produced no
+measurable speedup, and it drops the figure descriptions used as alt text.
+
+The conclusion: **there is no local speed win available that does not cost
+correctness.** The real bottleneck is that `mlx-vlm` cannot batch — it predicts
+one region at a time — and that is upstream, with no configuration knob. If the
+6–7 hours matters, the answer is to run MinerU somewhere with a batching GPU,
+not to tune it locally.
+
+---
+
 ## 5. Understanding the output files
 
-Every conversion produces four files in the output directory
+Every conversion produces five files in the output directory
 (default `./output/`):
 
 ### `{title}.epub`
@@ -232,7 +311,10 @@ Open this in any browser. It contains:
 
 - A summary table of every pipeline stage (duration, status, any errors).
 - A searchable, sortable table of every equation in the document showing:
-  - The source image crop (what the equation looked like in the original).
+  - The source image crop, for equations that did not pass cleanly. Crops are
+    ~20–100 KB each, so embedding one per equation would make a large book's
+    report hundreds of megabytes; equations that passed the gate show a note
+    instead.
   - The recognised LaTeX.
   - The CDM quality score (how closely the rendered SVG matches the original).
   - The confidence gate: **pass**, **repaired**, **fallback**, or **flagged**.
@@ -245,6 +327,13 @@ Use this file to diagnose any quality issues.
 
 Machine-readable summary of the pipeline run — useful if you want to script
 batch processing or check results programmatically.
+
+### `{title}_latex_snapshot.json`
+
+The recognised LaTeX for every equation, keyed by page and reading order. Used
+by `compare-snapshots` to prove a parser change did not alter recognition — see
+[Verifying a parser change](#verifying-a-parser-change). Also useful on its own
+for grepping what the recogniser actually produced for a given equation.
 
 ### `{title}_pipeline.log`
 

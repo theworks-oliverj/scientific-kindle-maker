@@ -4,7 +4,7 @@ Runs all stages in sequence for a single document.
 Models are loaded once and passed to the stages that need them.
 """
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Any
@@ -61,9 +61,6 @@ class PipelineConfig:
     mineru_timeout_per_page_s: int = 120
     mineru_timeout_s: Optional[int] = None
     mineru_reuse_existing: bool = True
-    # Raw flags appended to the mineru CLI call, for backend experiments
-    # (e.g. ["--effort", "medium"], ["--image-analysis", "false"]).
-    mineru_extra_args: list[str] = field(default_factory=list)
     # Fallback
     mathpix_app_id: Optional[str] = None
     mathpix_app_key: Optional[str] = None
@@ -189,7 +186,6 @@ class Pipeline:
                 reuse_existing=cfg.mineru_reuse_existing,
                 batch_size=cfg.mineru_batch_size,
                 timeout_per_page_s=cfg.mineru_timeout_per_page_s,
-                extra_args=cfg.mineru_extra_args,
             )
             result.stage_results.append(sr3)
             if not sr3.ok:
