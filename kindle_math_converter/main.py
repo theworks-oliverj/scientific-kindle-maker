@@ -77,6 +77,14 @@ def download_models_cmd() -> None:
 @click.option("--max-parallel-workers", default=None, type=int,
               help="Worker threads for s06/s08a per-equation work "
                    "(default: min(8, cpu_count)).")
+@click.option("--parse-batch-size", default=50, show_default=True, type=int,
+              help="Pages per MinerU invocation. Each batch caches its own "
+                   "parse, so a failed run resumes from the last completed "
+                   "batch instead of restarting. 0 parses the whole document "
+                   "in one go.")
+@click.option("--mineru-timeout", default=None, type=int,
+              help="Per-batch MinerU timeout in seconds. Default derives it "
+                   "from the batch's page count (120 s/page, 600 s floor).")
 def main(
     input_path: str,
     output_dir: str,
@@ -90,6 +98,8 @@ def main(
     no_epubcheck: bool,
     fresh_parse: bool,
     max_parallel_workers: int | None,
+    parse_batch_size: int,
+    mineru_timeout: int | None,
 ) -> None:
     """
     Convert a PDF or EPUB to Kindle-compatible EPUB3 with properly rendered
@@ -121,6 +131,8 @@ def main(
         epubcheck_enabled=not no_epubcheck,
         mineru_reuse_existing=not fresh_parse,
         max_parallel_workers=max_parallel_workers,
+        mineru_batch_size=parse_batch_size,
+        mineru_timeout_s=mineru_timeout,
     )
 
     console.print(f"\n[bold]Kindle Math Converter[/bold]")

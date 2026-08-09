@@ -690,8 +690,29 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# epubcheck's runtime scales with the book. 60 s is comfortable for a paper
+# and far too short for a 500-page textbook, so it is derived from the EPUB's
+# size with a generous floor.
+_EPUBCHECK_BASE_TIMEOUT_S = 120
+_EPUBCHECK_SECONDS_PER_MB = 12
+
+
+def _epubcheck_timeout_s(epub_path: Path) -> int:
+    try:
+        size_mb = epub_path.stat().st_size / (1024 * 1024)
+    except OSError:
+        return _EPUBCHECK_BASE_TIMEOUT_S
+    return int(_EPUBCHECK_BASE_TIMEOUT_S + size_mb * _EPUBCHECK_SECONDS_PER_MB)
+
+
 def _run_epubcheck(epub_path: Path, bus: EventBus) -> list[str]:
-    """Runs epubcheck. Returns list of error strings. Warnings are ignored."""
+    """Runs epubcheck. Returns list of error strings. Warnings are ignored.
+
+    A timeout is reported as an error, not as a clean result. epubcheck is the
+    pipeline's only automated correctness net — returning [] on timeout means
+    "validated OK" to the caller, which is precisely the wrong answer for the
+    large books most likely to time out.
+    """
     import shutil
 
     # Prefer an epubcheck wrapper script on PATH (e.g. Homebrew's, which
@@ -718,11 +739,12 @@ def _run_epubcheck(epub_path: Path, bus: EventBus) -> list[str]:
             return []
         cmd = [java, "-jar", str(jar), str(epub_path)]
 
+    timeout_s = _epubcheck_timeout_s(epub_path)
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            timeout=60,
+            timeout=timeout_s,
         )
         output = (result.stdout + result.stderr).decode(errors="replace")
         bus.emit("s10_epub_assembly", "epubcheck_output", payload={"output": output[:2000]})
@@ -733,8 +755,13 @@ def _run_epubcheck(epub_path: Path, bus: EventBus) -> list[str]:
         ]
         return error_lines
     except subprocess.TimeoutExpired:
-        log.warning("epubcheck_timeout")
-        return []
+        log.error("epubcheck_timeout", timeout_s=timeout_s)
+        bus.emit("s10_epub_assembly", "epubcheck_timeout", payload={"timeout_s": timeout_s})
+        return [
+            f"epubcheck did not finish within {timeout_s}s — the EPUB is "
+            f"UNVALIDATED. Re-run with --no-epubcheck to skip validation "
+            f"deliberately, or validate manually: epubcheck '{epub_path}'"
+        ]
 
 
 def run(

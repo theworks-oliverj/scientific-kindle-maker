@@ -2,6 +2,7 @@ import hashlib
 import re
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -44,6 +45,75 @@ def _cache_key(latex: str) -> str:
     T^{\\mu\\nu} and T^{\\mu\\rho} are different keys.
     """
     return hashlib.sha256(_normalize_latex(latex).encode('utf-8')).hexdigest()
+
+
+class PersistentCompileCache:
+    """
+    On-disk cache of tectonic compiles, keyed by normalized LaTeX.
+
+    Why this and not just the session render cache: once s08A reuses s06's
+    XDV, the surviving per-equation cost is s06's tectonic invocation. That
+    cost is paid again on every re-run, and a 500-page book will not come out
+    right on the first attempt — the second run of ~2000 equations should not
+    recompile all of them.
+
+    One file per key rather than a single index: lookups are a stat(), writes
+    are independent, and the thread pool in s06 needs no locking because two
+    workers writing the same key write identical bytes.
+
+    Only successful compiles are stored. A failure is cheap to rediscover and
+    caching one risks pinning a failure caused by a transient condition (a
+    timeout under load, a missing font on first use).
+    """
+
+    def __init__(self, cache_dir: "Path | None" = None):
+        self.dir = cache_dir
+        self._hits = 0
+        self._misses = 0
+        if self.dir is not None:
+            self.dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, latex: str, formula_class: str) -> "Path | None":
+        if self.dir is None:
+            return None
+        key = hashlib.sha256(
+            f"{formula_class}\x00{_normalize_latex(latex)}".encode("utf-8")
+        ).hexdigest()
+        return self.dir / f"{key}.xdv"
+
+    def get(self, latex: str, formula_class: str) -> bytes | None:
+        path = self._path(latex, formula_class)
+        if path is None:
+            return None
+        try:
+            data = path.read_bytes()
+        except OSError:
+            self._misses += 1
+            return None
+        self._hits += 1
+        return data
+
+    def put(self, latex: str, formula_class: str, xdv: bytes) -> None:
+        path = self._path(latex, formula_class)
+        if path is None or not xdv:
+            return
+        try:
+            # Write-then-rename so a crash mid-write cannot leave a truncated
+            # XDV that a later run would happily render.
+            tmp = path.with_suffix(".xdv.tmp")
+            tmp.write_bytes(xdv)
+            tmp.replace(path)
+        except OSError:
+            pass
+
+    @property
+    def stats(self) -> dict:
+        total = self._hits + self._misses
+        return {
+            "compile_cache_hits": self._hits,
+            "compile_cache_misses": self._misses,
+            "compile_cache_hit_rate": round(self._hits / total, 4) if total else 0.0,
+        }
 
 
 class SessionEquationCache:

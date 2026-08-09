@@ -101,6 +101,10 @@ REPORT_TEMPLATE = """
 <p style="font-size:0.8rem;color:#666">
   Sort by clicking column headers. Filter by typing below.
   Rows highlighted in red are flagged for review.
+  {% if crops_omitted %}
+  <br><strong>{{ crops_omitted }}</strong> further source crops were omitted to keep
+  this report openable — inspect them in the output directory instead.
+  {% endif %}
 </p>
 <input type="text" id="eq-filter" placeholder="Filter by equation ID, LaTeX, page...">
 <table id="eq-table">
@@ -129,10 +133,14 @@ REPORT_TEMPLATE = """
       <details>
         <summary>View</summary>
         <div class="eq-detail">
-          {% if eq.source_image_crop %}
+          {% if eq.source_image_crop and eq.region_id in crop_ids %}
           <div class="eq-crop">
             <strong>Source crop:</strong><br>
             <img src="data:image/png;base64,{{ eq.source_image_crop | b64 }}" alt="equation crop">
+          </div>
+          {% elif eq.source_image_crop %}
+          <div class="eq-crop" style="font-size:0.8rem;color:#666">
+            Source crop not embedded (equation passed the gate).
           </div>
           {% endif %}
           <div>
@@ -209,6 +217,31 @@ function sortTable(col) {
 """
 
 
+# Source crops run 20–100 KB each and base64 inflates them by a third, so
+# embedding one per equation makes the report scale with the book: ~2000
+# equations would produce a 50–250 MB single HTML file that no browser will
+# open. The report is also written from Pipeline.run()'s `finally` block, so
+# that cost lands on failed runs too. Only equations someone would actually
+# open the crop for are embedded.
+_MAX_EMBEDDED_CROPS = 200
+
+
+def _crops_to_embed(equations: list) -> tuple[set[str], int]:
+    """Region ids whose source crop is worth embedding, and how many were
+    dropped past the cap. A clean pass needs no visual check; anything that
+    was flagged, fell back, or did not pass the gate does."""
+    interesting = [
+        eq for eq in equations
+        if eq.source_image_crop and (
+            eq.flagged_for_review
+            or eq.fallback_used
+            or (eq.confidence_gate is not None and eq.confidence_gate.value != "pass")
+        )
+    ]
+    kept = interesting[:_MAX_EMBEDDED_CROPS]
+    return {eq.region_id for eq in kept}, len(interesting) - len(kept)
+
+
 def build_report(
     result: PipelineResult,
     document: Document | None,
@@ -233,6 +266,7 @@ def build_report(
     )
 
     equations = document.all_equations if document else []
+    crop_ids, crops_omitted = _crops_to_embed(equations)
 
     env = Environment(loader=BaseLoader())
     env.filters["b64"] = b64_filter
@@ -241,6 +275,8 @@ def build_report(
         result=result,
         document=document,
         equations=equations,
+        crop_ids=crop_ids,
+        crops_omitted=crops_omitted,
         event_bus=event_bus,
         error_events=error_events,
         total_duration_s=round(total_duration_s, 1),
