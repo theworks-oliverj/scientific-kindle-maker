@@ -50,6 +50,53 @@ def download_models_cmd() -> None:
                       "If on a VPN, try: HF_HUB_DISABLE_XET=1 or disable the VPN.")
 
 
+@cli.command("compare-snapshots")
+@click.argument("baseline", type=click.Path(exists=True, dir_okay=False))
+@click.argument("candidate", type=click.Path(exists=True, dir_okay=False))
+@click.option("--max-examples", default=15, show_default=True, type=int,
+              help="How many changed equations to print in full.")
+@click.option("--json-out", default=None, type=click.Path(),
+              help="Also write the full comparison as JSON.")
+def compare_snapshots_cmd(baseline: str, candidate: str, max_examples: int,
+                          json_out: str | None) -> None:
+    """
+    Diff two *_latex_snapshot.json files from different pipeline runs.
+
+    The regression oracle for parser experiments (a different MinerU backend,
+    a quantized model). Equation counts staying the same does NOT mean the
+    recognised LaTeX did — the gate is compile+plausibility, so a
+    wrong-but-compilable equation passes silently. This compares the strings.
+
+    \b
+    Exit code 0 = identical, 1 = differences found.
+    """
+    import json as _json
+    from .qa.latex_snapshot import compare, format_report
+
+    base = _json.loads(Path(baseline).read_text(encoding="utf-8"))
+    cand = _json.loads(Path(candidate).read_text(encoding="utf-8"))
+    report = compare(base, cand)
+
+    console.print(f"\n[bold]baseline [/bold] {baseline}")
+    console.print(f"[bold]candidate[/bold] {candidate}\n")
+    console.print(format_report(report, max_examples=max_examples), highlight=False)
+
+    if json_out:
+        Path(json_out).write_text(
+            _json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        console.print(f"\n  full comparison written to {json_out}")
+
+    if report["identical"]:
+        console.print("\n[bold green]  SAFE — recognition is unchanged.[/bold green]")
+    else:
+        console.print(
+            "\n[bold yellow]  REVIEW REQUIRED — recognition changed; "
+            "inspect the diffs above before accepting this change.[/bold yellow]"
+        )
+    sys.exit(0 if report["identical"] else 1)
+
+
 @cli.command("convert")
 @click.argument("input_path", type=click.Path(exists=True, dir_okay=False))
 @click.option("--output-dir", default="./output", show_default=True,
@@ -82,6 +129,13 @@ def download_models_cmd() -> None:
                    "parse, so a failed run resumes from the last completed "
                    "batch instead of restarting. 0 parses the whole document "
                    "in one go.")
+@click.option("--mineru-backend", default="vlm-engine", show_default=True,
+              help="MinerU backend: vlm-engine | hybrid-engine | pipeline. "
+                   "Changing this changes recognition — diff the run's "
+                   "_latex_snapshot.json with compare-snapshots before trusting it.")
+@click.option("--mineru-arg", "mineru_args", multiple=True,
+              help="Extra flag passed straight to the mineru CLI. Repeatable, "
+                   "e.g. --mineru-arg --effort --mineru-arg medium")
 @click.option("--mineru-timeout", default=None, type=int,
               help="Per-batch MinerU timeout in seconds. Default derives it "
                    "from the batch's page count (120 s/page, 600 s floor).")
@@ -99,6 +153,8 @@ def main(
     fresh_parse: bool,
     max_parallel_workers: int | None,
     parse_batch_size: int,
+    mineru_backend: str,
+    mineru_args: tuple[str, ...],
     mineru_timeout: int | None,
 ) -> None:
     """
@@ -133,6 +189,8 @@ def main(
         max_parallel_workers=max_parallel_workers,
         mineru_batch_size=parse_batch_size,
         mineru_timeout_s=mineru_timeout,
+        mineru_backend=mineru_backend,
+        mineru_extra_args=list(mineru_args),
     )
 
     console.print(f"\n[bold]Kindle Math Converter[/bold]")
