@@ -56,7 +56,14 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     # opencv (pulled in by mineru) needs these at import time
     .apt_install("libgl1", "libglib2.0-0")
-    .pip_install(f"mineru[core,vlm,vllm]=={MINERU_VERSION}")
+    # uv, and from a lock file, for two independent reasons:
+    #   - pip cannot resolve this tree. It backtracks through cffi sdists one
+    #     version at a time and does not converge (observed >10 min, no end in
+    #     sight). uv resolves the same spec in ~5 s.
+    #   - the lock pins every version that can affect recognition, so a
+    #     remote-vs-local diff measures the inference engine and nothing else.
+    # See modal-requirements.txt for how to regenerate it.
+    .uv_pip_install(requirements=["modal-requirements.txt"])
     .env(
         {
             # Same workaround the local runs use — Xet transfers stall on some
