@@ -129,6 +129,10 @@ def compare_snapshots_cmd(baseline: str, candidate: str, max_examples: int,
                    "parse, so a failed run resumes from the last completed "
                    "batch instead of restarting. 0 parses the whole document "
                    "in one go.")
+@click.option("--no-image-analysis", is_flag=True, default=False,
+              help="Skip MinerU's per-figure description pass. Saves time on "
+                   "image-heavy books; no measurable gain on figure-sparse "
+                   "ones. Figures lose their alt text.")
 @click.option("--mineru-timeout", default=None, type=int,
               help="Per-batch MinerU timeout in seconds. Default derives it "
                    "from the batch's page count (120 s/page, 600 s floor).")
@@ -146,6 +150,7 @@ def main(
     fresh_parse: bool,
     max_parallel_workers: int | None,
     parse_batch_size: int,
+    no_image_analysis: bool,
     mineru_timeout: int | None,
 ) -> None:
     """
@@ -180,6 +185,7 @@ def main(
         max_parallel_workers=max_parallel_workers,
         mineru_batch_size=parse_batch_size,
         mineru_timeout_s=mineru_timeout,
+        mineru_image_analysis=not no_image_analysis,
     )
 
     console.print(f"\n[bold]Kindle Math Converter[/bold]")

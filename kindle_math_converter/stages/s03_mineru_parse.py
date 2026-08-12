@@ -134,6 +134,7 @@ def _invoke_mineru(
     bus: EventBus,
     start_page: Optional[int] = None,
     end_page: Optional[int] = None,
+    image_analysis: bool = True,
 ) -> None:
     mineru_bin = Path(sys.executable).parent / "mineru"
     if not mineru_bin.exists():
@@ -145,6 +146,11 @@ def _invoke_mineru(
     if start_page is not None and end_page is not None:
         # -s/-e are 0-based and inclusive.
         cmd += ["-s", str(start_page), "-e", str(end_page)]
+    if not image_analysis:
+        # Skips the VLM's per-figure description pass. Measured as no gain on a
+        # figure-sparse paper, but the work scales with figure count, so it is
+        # worth having for image-heavy books. Costs FigureBlock.alt_text.
+        cmd += ["--image-analysis", "false"]
     env = dict(os.environ, PYTHONUNBUFFERED="1")
     log_path = work_dir / "mineru.log"
     bus.emit(STAGE, "mineru_invoke", backend=backend, log=str(log_path))
@@ -279,6 +285,7 @@ def run(
     reuse_existing: bool = True,
     batch_size: int = 50,
     timeout_per_page_s: int = 120,
+    image_analysis: bool = True,
 ) -> tuple[Document, StageResult]:
     """Parses `source_pdf` with MinerU and maps the result onto `document`.
 
@@ -347,6 +354,7 @@ def run(
                         source_pdf, batch_dir, backend,
                         _batch_timeout(n_pages, timeout_s, timeout_per_page_s),
                         bus, start_page=start, end_page=end,
+                        image_analysis=image_analysis,
                     )
                 except (RuntimeError, subprocess.TimeoutExpired) as exc:
                     errors.append(

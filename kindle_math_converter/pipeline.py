@@ -61,6 +61,10 @@ class PipelineConfig:
     mineru_timeout_per_page_s: int = 120
     mineru_timeout_s: Optional[int] = None
     mineru_reuse_existing: bool = True
+    # MinerU's per-figure description pass. Its cost scales with figure count —
+    # no measurable gain on a figure-sparse paper, potentially real on an
+    # image-heavy book. Disabling it drops FigureBlock.alt_text.
+    mineru_image_analysis: bool = True
     # Fallback
     mathpix_app_id: Optional[str] = None
     mathpix_app_key: Optional[str] = None
@@ -186,6 +190,7 @@ class Pipeline:
                 reuse_existing=cfg.mineru_reuse_existing,
                 batch_size=cfg.mineru_batch_size,
                 timeout_per_page_s=cfg.mineru_timeout_per_page_s,
+                image_analysis=cfg.mineru_image_analysis,
             )
             result.stage_results.append(sr3)
             if not sr3.ok:
