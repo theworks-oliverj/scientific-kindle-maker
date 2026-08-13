@@ -75,6 +75,10 @@ app = modal.App("kindle-math-converter-parse")
 # MinerU takes the same custom-logits-processor code path. A T4 (7.5) would
 # silently take a different one and invalidate any comparison.
 GPU = "L4"
+# 8 cores / 16 GiB, kept after measuring 4 / 8 against it. Four cores came out
+# ~6% cheaper per page on the mean but with a 1.7x spread against 1.05x, and
+# unpredictability is the thing that started this whole investigation. The 6%
+# is not worth reintroducing it. See the README for the numbers and caveats.
 CPU = 8.0
 MEMORY_MB = 16384
 

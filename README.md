@@ -341,6 +341,35 @@ Practical figures at the measured ~3.5 s/page:
 | 500 pages | ~32 min | ~$0.70 |
 | 1000 pages | ~63 min | ~$1.35 |
 
+### Choosing GPU, CPU and memory (measured 2026-08-12)
+
+Two configurations were measured on the same document, two parses each:
+
+| Config | $/hr | mean s/page | spread | parse cost per 1000 pp |
+|---|---|---|---|---|
+| **L4 + 8 cores + 16 GiB** | 1.30 | 4.1 | **1.05x** | $1.49 |
+| L4 + 4 cores + 8 GiB | 1.05 | 4.8 | 1.71x | $1.39 |
+
+**Use 8 cores and 16 GiB.** Halving them saves about 7% on the parse but makes
+throughput far less predictable, and unpredictability is what made the earlier
+runs swing 7x. Seven percent of a dollar is not worth that.
+
+**Caveat, stated plainly:** two parses per configuration, and the two runs
+landed on hosts with different core counts (24 vs 20) and memory (381 vs
+190 GB). The CPU request is therefore *not* cleanly isolated from host
+variation. Treat this as directional, not conclusive.
+
+GPU choice is firmer. L4 matched A10G's best observed throughput at 27% lower
+cost, so A10G buys nothing here. **Do not use T4** at any price: its compute
+capability is 7.5, below the 8.0 threshold at which MinerU enables custom logits
+processors, so it silently takes a different code path and changes recognition.
+
+The larger lever is **batch size, not resources.** Engine startup costs 69–145 s
+per `mineru` invocation, so it dominates short jobs and vanishes on long ones —
+on a 6-page paper it is most of the run; across a 250-page batch it adds ~7%.
+Prefer large page batches, bounded by how much work you are willing to redo if
+one fails.
+
 ### Detecting a stuck remote parse
 
 A wall-clock timeout is the wrong instrument for this: short enough to catch a
