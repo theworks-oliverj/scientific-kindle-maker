@@ -354,10 +354,43 @@ Two configurations were measured on the same document, two parses each:
 throughput far less predictable, and unpredictability is what made the earlier
 runs swing 7x. Seven percent of a dollar is not worth that.
 
-**Caveat, stated plainly:** two parses per configuration, and the two runs
-landed on hosts with different core counts (24 vs 20) and memory (381 vs
-190 GB). The CPU request is therefore *not* cleanly isolated from host
-variation. Treat this as directional, not conclusive.
+**This experiment was flawed — treat the result as a weak signal, not a
+finding.** Three problems, in order of severity:
+
+1. **Two variables moved at once.** CPU went 8 → 4 *and* memory 16 → 8 GiB, so
+   neither can be credited. The more plausible mechanism is actually memory:
+   8 GiB leaves little page cache for a 2.2 GB model plus 300 dpi page rasters,
+   so the slow parse may have been re-reading from the network-backed Volume.
+2. **Two parses per configuration.** Far too few to separate a real effect from
+   ordinary noise.
+3. **The runs landed on different host classes** (24 cores/381 GB versus
+   20/190). Those are the *physical host*, not our slice — `cpu=` and `memory=`
+   are reservations — but a core is not a fixed unit of speed across CPU
+   generations, and neighbours contend for memory bandwidth and the PCIe path to
+   the GPU.
+
+Keeping 8 cores and 16 GiB is the conservative call, not a proven optimum. To
+settle it: change one variable at a time, repeat within a single container (jobs
+in one container share hardware, which controls for placement), and pin
+`region=` so the hardware pool is narrower.
+
+### What varies between runs, and what to do about it
+
+Modal schedules onto whatever worker is free across its fleet, so host specs
+differ run to run. What this means in practice:
+
+| Factor | Under your control? | How |
+|---|---|---|
+| Your CPU/memory slice | **Yes** — it is a reservation | `cpu=`, `memory=` |
+| Host CPU generation | Partly | `region=` / `cloud=` narrows the pool |
+| Noisy neighbours | No | repeat measurements; compare within one container |
+| Engine init cost | **Yes** | larger page batches amortise it |
+
+The runner logs `affinity_cpus` and the cgroup CPU/memory limits — the
+allocation itself — alongside the host CPU model. An earlier version logged only
+`os.cpu_count()` and `/proc/meminfo`, which describe the host and say nothing
+about your slice; that is what made the first timing differences impossible to
+attribute.
 
 GPU choice is firmer. L4 matched A10G's best observed throughput at 27% lower
 cost, so A10G buys nothing here. **Do not use T4** at any price: its compute

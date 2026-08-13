@@ -102,6 +102,19 @@ STALL_TIMEOUT_S = 420
 # function is ever deployed rather than run.
 SCALEDOWN_WINDOW_S = 2
 
+# Modal places containers on whatever worker is free across its fleet, so two
+# runs can land on different host classes — 24 cores/381 GB on one measured run,
+# 20/190 on the next. That does not change OUR slice (cpu= and memory= are
+# reservations), but a core is not a fixed unit of speed across CPU generations,
+# and neighbours on the same host contend for memory bandwidth, PCIe to the GPU,
+# and the network path to the Volume.
+#
+# Setting region (e.g. "us-east") or cloud narrows the hardware pool and should
+# reduce that variance, at the cost of waiting longer for capacity. Left unset
+# because the benefit here is unmeasured — turn it on for a controlled
+# experiment, where holding hardware constant matters more than scheduling speed.
+REGION: str | None = None
+
 # tqdm writes "<done>/<total>" — e.g. "Predict:  48%|####  | 94/197 [01:13<...]".
 # That counter is the only trustworthy evidence that work is actually moving;
 # the surrounding text redraws whether or not it is.
@@ -109,13 +122,20 @@ _PROGRESS_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 
 
 def _telemetry() -> dict:
-    """What hardware we actually landed on. The first two runs differed 4–7× in
-    speed with no record of what they ran on, which made the cause unfalsifiable.
-    Never again."""
+    """What we actually got, not what the host happens to have.
+
+    The first version of this logged `os.cpu_count()` and `/proc/meminfo`, which
+    report the *physical host* — 24 cores and 381 GB on one run, 20 and 190 on
+    the next — while saying nothing about this container's slice. That made the
+    timing differences between runs unattributable, which is the exact failure
+    it existed to prevent. It now records the allocation itself, and the host CPU
+    model, since a core is not a fixed unit of speed across CPU generations.
+    """
     import os
     import subprocess
 
     out: dict[str, object] = {}
+
     try:
         gpu = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
@@ -125,18 +145,59 @@ def _telemetry() -> dict:
         out["gpu"] = gpu.stdout.strip()
     except Exception as exc:
         out["gpu"] = f"unavailable: {exc}"
-    out["os_cpu_count"] = os.cpu_count()
+
+    # OUR allocation. sched_getaffinity is usually the honest answer inside a
+    # container; cgroup quota is the other, and they disagree often enough that
+    # both are worth having. Sandboxed runtimes may expose neither, so this
+    # records which method answered rather than silently reporting "unknown".
     try:
-        # cgroup v2 quota is what the container may actually use, which is not
-        # the same as the host core count os.cpu_count() reports.
-        quota = open("/sys/fs/cgroup/cpu.max").read().split()
-        out["cgroup_cpu_max"] = f"{quota[0]}/{quota[1]}"
+        out["affinity_cpus"] = len(os.sched_getaffinity(0))
     except Exception:
-        out["cgroup_cpu_max"] = "unknown"
+        out["affinity_cpus"] = None
+    quota = None
+    for path, parse in (
+        ("/sys/fs/cgroup/cpu.max", lambda t: None if t.split()[0] == "max"
+         else float(t.split()[0]) / float(t.split()[1])),
+        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", None),  # v1, needs the period too
+    ):
+        try:
+            text = open(path).read().strip()
+            if parse:
+                quota = parse(text)
+            else:
+                period = float(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+                q = float(text)
+                quota = None if q < 0 else q / period
+            if quota is not None:
+                break
+        except Exception:
+            continue
+    out["cgroup_cpu_limit"] = quota
+    for path in ("/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            text = open(path).read().strip()
+            out["cgroup_mem_limit_gib"] = (
+                None if text == "max" else round(int(text) / 1024**3, 1)
+            )
+            break
+        except Exception:
+            continue
+
+    # Host context. Not our slice, but a core's speed depends on which CPU it is,
+    # so this is what makes "same core count, different throughput" explicable.
+    try:
+        for line in open("/proc/cpuinfo"):
+            if line.startswith("model name"):
+                out["host_cpu_model"] = line.split(":", 1)[1].strip()
+                break
+    except Exception:
+        pass
+    out["host_cpu_count"] = os.cpu_count()
     try:
         for line in open("/proc/meminfo"):
             if line.startswith("MemTotal"):
-                out["mem_total"] = line.split(":", 1)[1].strip()
+                out["host_mem"] = line.split(":", 1)[1].strip()
                 break
     except Exception:
         pass
@@ -150,6 +211,7 @@ def _telemetry() -> dict:
     memory=MEMORY_MB,
     timeout=TIMEOUT_S,
     scaledown_window=SCALEDOWN_WINDOW_S,
+    region=REGION,
     volumes={"/root/.cache/huggingface": hf_cache, "/results": results},
 )
 def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict:
