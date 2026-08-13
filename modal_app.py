@@ -75,9 +75,26 @@ app = modal.App("kindle-math-converter-parse")
 GPU = "L4"
 CPU = 8.0
 MEMORY_MB = 16384
-# Hard ceiling. At L4 + 8 CPU + 16 GiB this bounds a run to roughly $0.43, which
-# matters more than usual when the budget is a fixed prepaid credit.
-TIMEOUT_S = 1200
+
+# A wall-clock cap is the wrong instrument for detecting a stuck parse: set it
+# short and a legitimately long book is killed, set it long and a hang burns the
+# whole budget before anyone notices. So the timeout here is only a last-resort
+# backstop, sized for the longest book we would ever submit, and the real
+# control is the stall watchdog below.
+TIMEOUT_S = 6 * 60 * 60
+
+# MinerU emits tqdm progress continuously while it works. Silence therefore
+# means stuck, not slow — a slow page still prints. If nothing is written for
+# this long, the batch is killed and the run moves on rather than paying for a
+# wedged container. Generous enough to cover vLLM engine init (52–128 s
+# measured) plus a hard page.
+STALL_TIMEOUT_S = 420
+
+# Modal keeps a container alive after its last input and bills for that idle
+# time; the default is 60 s. `modal run` tears the ephemeral app down at exit so
+# it does not apply there, but this makes the intent explicit and matters if the
+# function is ever deployed rather than run.
+SCALEDOWN_WINDOW_S = 2
 
 
 def _telemetry() -> dict:
@@ -121,9 +138,10 @@ def _telemetry() -> dict:
     cpu=CPU,
     memory=MEMORY_MB,
     timeout=TIMEOUT_S,
+    scaledown_window=SCALEDOWN_WINDOW_S,
     volumes={"/root/.cache/huggingface": hf_cache, "/results": results},
 )
-def parse_jobs(jobs: list[dict]) -> dict:
+def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict:
     """Runs every job in ONE container, sequentially.
 
     One container is the point: vLLM engine init costs 177–688 s and is paid per
@@ -138,6 +156,7 @@ def parse_jobs(jobs: list[dict]) -> dict:
     import shutil
     import subprocess
     import tarfile
+    import threading
     import time
     from pathlib import Path
 
@@ -168,17 +187,46 @@ def parse_jobs(jobs: list[dict]) -> dict:
 
         # Stream rather than capture: capture_output=True buffers until exit,
         # which here means minutes of silence indistinguishable from a hang.
+        # A watchdog thread reads the clock while the main thread reads output —
+        # if output stops, the parse is stuck and the container is burning money
+        # for nothing, so kill it instead of waiting out the function timeout.
         lines: list[str] = []
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
         )
         assert proc.stdout is not None
+
+        last_output = [time.monotonic()]
+        stalled = [False]
+
+        def watchdog() -> None:
+            while proc.poll() is None:
+                quiet = time.monotonic() - last_output[0]
+                if quiet > stall_timeout_s:
+                    stalled[0] = True
+                    print(
+                        f"[kmc] {label} STALLED — no output for {quiet:.0f}s "
+                        f"(limit {stall_timeout_s}s); killing",
+                        flush=True,
+                    )
+                    proc.kill()
+                    return
+                time.sleep(5)
+
+        watch = threading.Thread(target=watchdog, daemon=True)
+        watch.start()
+
         for line in proc.stdout:
+            last_output[0] = time.monotonic()
             lines.append(line)
             print(f"[mineru:{label}] {line.rstrip()[:150]}", flush=True)
         rc = proc.wait()
+        watch.join(timeout=10)
         elapsed = time.perf_counter() - t0
         log = "".join(lines)
+        if stalled[0]:
+            rc = rc or -1
+            log += f"\n[kmc] killed after {stall_timeout_s}s without output\n"
         print(f"[kmc] {label} exited {rc} after {elapsed:.0f}s", flush=True)
 
         record: dict = {
@@ -187,6 +235,7 @@ def parse_jobs(jobs: list[dict]) -> dict:
             "start": job.get("start"),
             "end": job.get("end"),
             "returncode": rc,
+            "stalled": stalled[0],
             "elapsed_s": round(elapsed, 1),
             "log_tail": log[-3000:],
             "tar": None,

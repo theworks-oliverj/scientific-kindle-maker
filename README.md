@@ -292,6 +292,47 @@ one region at a time — and that is upstream, with no configuration knob. If th
 6–7 hours matters, the answer is to run MinerU somewhere with a batching GPU,
 not to tune it locally.
 
+### Working out what a GPU run costs
+
+Cost is **not** just the GPU rate. Modal bills the GPU, the CPU cores you request,
+and the memory you request, for every second the container is alive:
+
+```
+$/second = gpu_rate + (cpu_cores x 0.0000131) + (memory_GiB x 0.00000222)
+```
+
+GPU rates per second: T4 `0.000164`, L4 `0.000222`, A10G `0.000306`,
+L40S `0.000542`, A100-40GB `0.000583`, A100-80GB `0.000694`, H100 `0.001097`.
+
+**Requested CPU and memory are a large share of the bill** — not a rounding error.
+For L4 with 8 cores and 16 GiB they are 39% of the total. Sizing them by
+guesswork wastes real money:
+
+| Configuration | $/hour |
+|---|---|
+| L4 + 2 cores + 8 GiB | $0.96 |
+| L4 + 4 cores + 8 GiB | $1.05 |
+| L4 + 8 cores + 16 GiB | $1.30 |
+| A10G + 8 cores + 16 GiB | $1.61 |
+| L40S + 8 cores + 16 GiB | $2.46 |
+
+**What counts as billable seconds:** from container start until the function
+returns. Local upload and download time is not billed. Idle time *is* billed —
+`scaledown_window` keeps a container alive after its last input and defaults to
+**60 seconds**, which you pay for. `modal run` uses an ephemeral app that is torn
+down when the entrypoint exits, so it avoids that tail; a deployed function does
+not, and should set `scaledown_window` low.
+
+Verified against a real invoice: an L4 + 8 core + 16 GiB run with 529 s of work
+billed 552 s and cost **$0.20**, matching the formula to within 4%.
+
+Practical figures at the measured ~3.5 s/page:
+
+| Book | Parse | Cost (L4 + 8 + 16) |
+|---|---|---|
+| 500 pages | ~32 min | ~$0.70 |
+| 1000 pages | ~63 min | ~$1.35 |
+
 ### Local runs are reproducible; GPU runs are not
 
 Running the same document twice locally produces identical output. The Apple
