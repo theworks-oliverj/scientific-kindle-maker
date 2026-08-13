@@ -292,6 +292,31 @@ one region at a time — and that is upstream, with no configuration knob. If th
 6–7 hours matters, the answer is to run MinerU somewhere with a batching GPU,
 not to tune it locally.
 
+### Local runs are reproducible; GPU runs are not
+
+Running the same document twice locally produces identical output. The Apple
+Silicon path (`mlx-engine`) predicts one region at a time, and MinerU requests
+greedy decoding (`temperature=0.0, top_k=1`), so the result is deterministic.
+
+**A CUDA GPU running `vllm-engine` is not deterministic.** Measured on the same
+PDF, same pinned package set, same model, two consecutive runs: **2 of 153
+equations differed.** This is not a sampling setting that can be corrected —
+MinerU already requests greedy decoding on every backend. It is a property of
+vLLM's batched execution: batch composition changes the order of floating-point
+reductions, so identical greedy requests can resolve to different tokens
+depending on how the scheduler grouped them.
+
+Practical consequences:
+
+- Converting the same book twice on a GPU yields two slightly different EPUBs.
+  For reading a book once, this does not matter. For reproducing someone else's
+  output exactly, it cannot be relied upon — pinning package versions does not
+  make it reproducible.
+- Snapshot comparison against a GPU-produced baseline carries ~2% noise. Treat
+  small diffs as inconclusive rather than as a regression.
+
+Design around it rather than trying to fix it.
+
 ---
 
 ## 5. Understanding the output files
