@@ -294,6 +294,11 @@ not to tune it locally.
 
 ### Working out what a GPU run costs
 
+> **Rates below were captured on 2026-08-12 and verified against one real
+> invoice on that date. Cloud pricing moves — re-check
+> <https://modal.com/pricing> before relying on these figures, and treat any
+> estimate derived from them as stale after a few months.**
+
 Cost is **not** just the GPU rate. Modal bills the GPU, the CPU cores you request,
 and the memory you request, for every second the container is alive:
 
@@ -301,8 +306,9 @@ and the memory you request, for every second the container is alive:
 $/second = gpu_rate + (cpu_cores x 0.0000131) + (memory_GiB x 0.00000222)
 ```
 
-GPU rates per second: T4 `0.000164`, L4 `0.000222`, A10G `0.000306`,
-L40S `0.000542`, A100-40GB `0.000583`, A100-80GB `0.000694`, H100 `0.001097`.
+GPU rates per second (as of 2026-08-12): T4 `0.000164`, L4 `0.000222`,
+A10G `0.000306`, L40S `0.000542`, A100-40GB `0.000583`, A100-80GB `0.000694`,
+H100 `0.001097`.
 
 **Requested CPU and memory are a large share of the bill** — not a rounding error.
 For L4 with 8 cores and 16 GiB they are 39% of the total. Sizing them by
@@ -315,6 +321,8 @@ guesswork wastes real money:
 | L4 + 8 cores + 16 GiB | $1.30 |
 | A10G + 8 cores + 16 GiB | $1.61 |
 | L40S + 8 cores + 16 GiB | $2.46 |
+
+*(rate card current as of 2026-08-12)*
 
 **What counts as billable seconds:** from container start until the function
 returns. Local upload and download time is not billed. Idle time *is* billed —
@@ -332,6 +340,27 @@ Practical figures at the measured ~3.5 s/page:
 |---|---|---|
 | 500 pages | ~32 min | ~$0.70 |
 | 1000 pages | ~63 min | ~$1.35 |
+
+### Detecting a stuck remote parse
+
+A wall-clock timeout is the wrong instrument for this: short enough to catch a
+hang quickly and it kills a legitimately long book; long enough for 1000 pages
+and a hang burns hours of rented GPU first.
+
+So the remote runner watches **progress**, not elapsed time and not merely
+output. MinerU prints a tqdm counter (`94/197`), and the watchdog requires that
+counter to *advance*. This matters because a process can keep printing while the
+work behind it is wedged — a redrawing bar or a heartbeat log is
+indistinguishable from progress unless you read the number. Silence is only the
+easy case.
+
+Before any counter exists (engine startup prints plenty and counts nothing) it
+falls back to time-since-output, which is the right measure for that phase. A
+health line every 60 s reports the current counter and seconds since it last
+moved. The function timeout remains only as a backstop that should never fire.
+
+Consequence: a 700-page book that wedges at page 562 costs one stall window,
+not the remainder of the run — and batches already committed survive it.
 
 ### Local runs are reproducible; GPU runs are not
 

@@ -36,6 +36,8 @@ USAGE
     modal run modal_app.py --pdf "/path/a.pdf" --repeat 2      # determinism check
     modal run modal_app.py --pdf "/path/a.pdf" --batch-pages 5 # resumable batches
 """
+import re
+
 import modal
 
 # Pinned to the local install. The comparison is between inference engines, so
@@ -95,6 +97,11 @@ STALL_TIMEOUT_S = 420
 # it does not apply there, but this makes the intent explicit and matters if the
 # function is ever deployed rather than run.
 SCALEDOWN_WINDOW_S = 2
+
+# tqdm writes "<done>/<total>" — e.g. "Predict:  48%|####  | 94/197 [01:13<...]".
+# That counter is the only trustworthy evidence that work is actually moving;
+# the surrounding text redraws whether or not it is.
+_PROGRESS_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 
 
 def _telemetry() -> dict:
@@ -196,16 +203,53 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict
         )
         assert proc.stdout is not None
 
-        last_output = [time.monotonic()]
-        stalled = [False]
+        # Watching for *output* is not enough. A process can keep printing while
+        # the work behind it is wedged — a redrawing progress bar or a heartbeat
+        # log looks identical to progress from the outside. So the watchdog
+        # tracks the progress COUNTER (tqdm's "94/197") and requires it to
+        # advance. Chatty-but-frozen is the failure this catches; silence is
+        # only the easy case.
+        #
+        # Before any counter exists (vLLM init prints plenty and counts
+        # nothing), it falls back to time-since-output, which is the right
+        # measure for that phase.
+        lines: list[str] = []
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+        assert proc.stdout is not None
+
+        now = time.monotonic
+        last_output = [now()]
+        last_advance = [now()]
+        progress: list[tuple[int, int] | None] = [None]  # (done, total), None until seen
+        stalled = [""]
 
         def watchdog() -> None:
+            beat = now()
             while proc.poll() is None:
-                quiet = time.monotonic() - last_output[0]
-                if quiet > stall_timeout_s:
-                    stalled[0] = True
+                t = now()
+                tracking = progress[0] is not None
+                # Once a counter exists, frozen progress is the signal. Until
+                # then, silence is.
+                quiet = t - (last_advance[0] if tracking else last_output[0])
+
+                if t - beat >= 60:  # visibility while it is healthy
+                    beat = t
+                    where = f"progress {progress[0][0]}/{progress[0][1]}" if tracking else "starting up"
                     print(
-                        f"[kmc] {label} STALLED — no output for {quiet:.0f}s "
+                        f"[kmc] {label} alive — {where}, "
+                        f"{quiet:.0f}s since last advance (limit {stall_timeout_s}s)",
+                        flush=True,
+                    )
+
+                if quiet > stall_timeout_s:
+                    stalled[0] = (
+                        f"progress frozen at {progress[0][0]}/{progress[0][1]}"
+                        if tracking else "no output"
+                    )
+                    print(
+                        f"[kmc] {label} STALLED — {stalled[0]} for {quiet:.0f}s "
                         f"(limit {stall_timeout_s}s); killing",
                         flush=True,
                     )
@@ -217,8 +261,17 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict
         watch.start()
 
         for line in proc.stdout:
-            last_output[0] = time.monotonic()
+            last_output[0] = now()
             lines.append(line)
+            # tqdm renders "<done>/<total>"; a change in either element counts
+            # as advancing, so moving between phases (layout -> content) is not
+            # mistaken for a stall.
+            m = _PROGRESS_RE.search(line)
+            if m:
+                state = (int(m.group(1)), int(m.group(2)))
+                if state != progress[0]:
+                    progress[0] = state
+                    last_advance[0] = now()
             print(f"[mineru:{label}] {line.rstrip()[:150]}", flush=True)
         rc = proc.wait()
         watch.join(timeout=10)
@@ -226,7 +279,7 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict
         log = "".join(lines)
         if stalled[0]:
             rc = rc or -1
-            log += f"\n[kmc] killed after {stall_timeout_s}s without output\n"
+            log += f"\n[kmc] killed: {stalled[0]} for >{stall_timeout_s}s\n"
         print(f"[kmc] {label} exited {rc} after {elapsed:.0f}s", flush=True)
 
         record: dict = {
