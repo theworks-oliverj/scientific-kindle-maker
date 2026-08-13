@@ -350,9 +350,12 @@ Two configurations were measured on the same document, two parses each:
 | **L4 + 8 cores + 16 GiB** | 1.30 | 4.1 | **1.05x** | $1.49 |
 | L4 + 4 cores + 8 GiB | 1.05 | 4.8 | 1.71x | $1.39 |
 
-**Use 8 cores and 16 GiB.** Halving them saves about 7% on the parse but makes
-throughput far less predictable, and unpredictability is what made the earlier
-runs swing 7x. Seven percent of a dollar is not worth that.
+**Use 8 cores and 16 GiB — the decision is reliability, not price.** Halving
+them saves about 7% on the parse, which on a 1000-page book is roughly ten
+cents. In exchange, two identical parses came back 1.7x apart instead of 1.05x.
+Unpredictable throughput is not just annoying: it is what makes a long run's
+duration and cost unquotable, and it is the problem that started this whole
+investigation. A dime is not worth reintroducing it.
 
 **This experiment was flawed — treat the result as a weak signal, not a
 finding.** Three problems, in order of severity:
@@ -382,9 +385,21 @@ differ run to run. What this means in practice:
 | Factor | Under your control? | How |
 |---|---|---|
 | Your CPU/memory slice | **Yes** — it is a reservation | `cpu=`, `memory=` |
-| Host CPU generation | Partly | `region=` / `cloud=` narrows the pool |
+| Host CPU generation | In principle | `region=`/`cloud=` — **but see below** |
 | Noisy neighbours | No | repeat measurements; compare within one container |
 | Engine init cost | **Yes** | larger page batches amortise it |
+
+**Region pinning is deliberately not used.** Modal charges **1.5–1.75x base
+prices** for region selection, which would take this configuration from $1.30/hr
+to $1.95–2.28/hr. That is a 50–75% surcharge to narrow a spread that was never
+isolated in the first place.
+
+It is also largely unnecessary. `cpu=` and `memory=` are *reservations* — your
+slice is the same whichever host you land on — and `gpu=` pins the accelerator
+model. What the host still influences is second-order: which CPU generation
+those cores belong to, and contention with neighbours for memory bandwidth, the
+PCIe path to the GPU, and the network path to the Volume. Let Modal place the
+work wherever it likes and pay base rates.
 
 The runner logs `affinity_cpus` and the cgroup CPU/memory limits — the
 allocation itself — alongside the host CPU model. An earlier version logged only

@@ -75,10 +75,16 @@ app = modal.App("kindle-math-converter-parse")
 # MinerU takes the same custom-logits-processor code path. A T4 (7.5) would
 # silently take a different one and invalidate any comparison.
 GPU = "L4"
-# 8 cores / 16 GiB, kept after measuring 4 / 8 against it. Four cores came out
-# ~6% cheaper per page on the mean but with a 1.7x spread against 1.05x, and
-# unpredictability is the thing that started this whole investigation. The 6%
-# is not worth reintroducing it. See the README for the numbers and caveats.
+# 8 cores / 16 GiB. Measured against 4 / 8, which came out ~7% cheaper per page
+# on the mean but with a 1.7x spread between two identical parses, against 1.05x
+# here. On a 1000-page book that trade is roughly $0.10 saved in exchange for
+# throughput you cannot predict — and unpredictable throughput is what started
+# this whole investigation, since it is also what makes a long run's cost and
+# duration unquotable. Reliability is worth more than the dime.
+#
+# Note the comparison was flawed (CPU and memory moved together, n=2, different
+# host classes), so this is the conservative choice rather than a proven
+# optimum. The README records how to settle it properly if it ever matters.
 CPU = 8.0
 MEMORY_MB = 16384
 
@@ -102,18 +108,17 @@ STALL_TIMEOUT_S = 420
 # function is ever deployed rather than run.
 SCALEDOWN_WINDOW_S = 2
 
-# Modal places containers on whatever worker is free across its fleet, so two
-# runs can land on different host classes — 24 cores/381 GB on one measured run,
-# 20/190 on the next. That does not change OUR slice (cpu= and memory= are
-# reservations), but a core is not a fixed unit of speed across CPU generations,
-# and neighbours on the same host contend for memory bandwidth, PCIe to the GPU,
-# and the network path to the Volume.
+# Deliberately NOT pinning region or cloud. Modal charges **1.5–1.75x base
+# prices** for region selection, which would take this config from $1.30/h to
+# $1.95–2.28/h.
 #
-# Setting region (e.g. "us-east") or cloud narrows the hardware pool and should
-# reduce that variance, at the cost of waiting longer for capacity. Left unset
-# because the benefit here is unmeasured — turn it on for a controlled
-# experiment, where holding hardware constant matters more than scheduling speed.
-REGION: str | None = None
+# It is also not needed. `cpu=` and `memory=` are reservations, so our slice is
+# the same whatever host we land on, and `gpu="L4"` pins the accelerator. What
+# the host still affects is second-order: which CPU generation those 8 cores
+# belong to, and contention with neighbours for memory bandwidth, the PCIe path
+# to the GPU, and the network path to the Volume. Paying a 50–75% surcharge to
+# narrow that is a bad trade — and the spread it would address was never even
+# isolated (see the README's note on that flawed experiment).
 
 # tqdm writes "<done>/<total>" — e.g. "Predict:  48%|####  | 94/197 [01:13<...]".
 # That counter is the only trustworthy evidence that work is actually moving;
@@ -211,7 +216,6 @@ def _telemetry() -> dict:
     memory=MEMORY_MB,
     timeout=TIMEOUT_S,
     scaledown_window=SCALEDOWN_WINDOW_S,
-    region=REGION,
     volumes={"/root/.cache/huggingface": hf_cache, "/results": results},
 )
 def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict:
