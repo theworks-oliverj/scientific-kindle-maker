@@ -103,11 +103,49 @@ This tool does four things differently:
 
 ## 2. System requirements
 
-- **macOS** (Apple Silicon or Intel). Linux works with minor path differences.
 - **Python 3.10 or later.**
 - **~5 GB free disk space** for model weights and tools.
 - **Internet connection** for the first run (to download models).
-- No GPU required — everything runs on CPU.
+- **A GPU, effectively.** Details below — this is the requirement that decides
+  whether the tool is usable on a given machine.
+
+### The parse needs a GPU
+
+MinerU is a vision-language model and it is ~95% of a long run's wall clock.
+`-b vlm-engine` does not name an engine; it asks MinerU to pick one for the
+platform, and the choice is what determines whether a book takes hours or weeks:
+
+| Platform | Engine chosen | Runs on |
+|---|---|---|
+| **Apple Silicon**, macOS ≥ 13.5, `mlx-vlm` installed | `mlx-engine` | **the Apple GPU**, via Metal |
+| **Linux** with `vllm` installed | `vllm-engine` | **a CUDA GPU** (required by vLLM) |
+| Linux with `lmdeploy` instead | `lmdeploy-engine` | a CUDA GPU |
+| **Anything else** — Intel Mac, Linux without either, missing extra | `transformers` | **CPU** |
+
+The measured reference is **~45 s/page on an M4's GPU**. The `transformers` CPU
+fallback is not a slower version of that. It has never been benchmarked here, but
+this project's CPU-inference scoping (done while costing out AWS Lambda) put a
+1000-page book at **38–126 hours** of CPU VLM time; halve that for 500 pages.
+Treat that row as "does not work", not as "slow".
+
+It is a quiet failure: MinerU falls back without erroring, so the first sign is
+a run that never finishes. If a parse is running far slower than 45 s/page,
+check which engine was selected before looking anywhere else.
+
+**Practically:**
+
+- **Apple Silicon Mac** — supported, no extra hardware. Install
+  `mineru[vlm,mlx]`. This is what the project is developed and measured on.
+- **Linux with an NVIDIA GPU** — supported. Install `mineru[vlm,vllm]`. Note
+  recognition differs slightly from the Mac path and is not reproducible run to
+  run; see [Local runs are reproducible; GPU runs are not](#local-runs-are-reproducible-gpu-runs-are-not).
+- **Intel Mac, or any machine without a GPU** — the local parse is not viable.
+  Rent the parse instead: see [Running the parse on a GPU](#running-the-parse-on-a-gpu).
+  Everything after the parse (equation compiling, SVG rendering, EPUB assembly)
+  is CPU work and runs fine anywhere.
+
+The rest of the pipeline needs no GPU. tectonic, dvisvgm, poppler and epubcheck
+are all CPU subprocesses.
 
 ---
 
@@ -151,13 +189,11 @@ cd "Scientific Kindle Maker"
 
 All subsequent commands are run from this directory.
 
-### Step 4 — Install CPU PyTorch
-
-This must be installed before the other packages. If you install it after,
-pip may have already pulled a 3 GB GPU build that won't uninstall cleanly.
+### Step 4 — Create a virtual environment
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
 ### Step 5 — Install Python dependencies
@@ -168,6 +204,39 @@ pip install -r kindle_math_converter/requirements.txt
 
 This takes a few minutes. If you see any red error lines, see
 [Troubleshooting → Installation errors](#installation-errors).
+
+The requirements file selects MinerU's platform extra for you —
+`mineru[vlm,mlx]` on macOS, `mineru[vlm,vllm]` on Linux. **That extra is the
+GPU backend**, and without it MinerU silently falls back to CPU inference that
+is too slow to finish a book. See [System requirements](#2-system-requirements).
+
+**On Linux, use `uv` instead of pip.** pip cannot resolve the `vllm` branch of
+this dependency tree — it backtracks through cffi sdists indefinitely, with no
+end observed after ten minutes. uv does it in about five seconds:
+
+```bash
+uv pip install -r kindle_math_converter/requirements.txt
+```
+
+There is also a fully-pinned Linux x86_64 set in the repo root,
+`modal-requirements.txt` — it is what the Modal GPU image is built from and is
+therefore the most-tested Linux dependency set in this project. macOS needs
+none of this; the `mlx` branch resolves under plain pip in seconds.
+
+Verify the right engine was installed:
+
+```bash
+python -c "from mineru.utils.engine_utils import get_vlm_engine; print(get_vlm_engine('auto'))"
+```
+
+Expect `mlx-engine` on an Apple Silicon Mac, or `vllm-engine` on Linux with an
+NVIDIA GPU. If it prints `transformers`, the extra did not install — fix that
+before converting anything.
+
+> **Note on PyTorch.** Earlier versions of this guide told you to install a
+> CPU-only build of torch first. Do not do that any more: on Linux it breaks
+> vLLM, which needs the CUDA build. On Apple Silicon torch is only a transitive
+> dependency — the model runs on MLX, not torch.
 
 ### Step 6 — Download AI model weights
 
@@ -779,18 +848,36 @@ Stage 11 — Output
 
 ### Installation errors
 
-**`ERROR: ResolutionImpossible` during `pip install`**
+**`ERROR: ResolutionImpossible`, or pip hangs for minutes during install**
 
-This means two packages require incompatible versions of a shared dependency.
-The most common cause is PyTorch being installed after other packages.
-Fix: create a fresh virtual environment and follow the install steps in order.
+On **Linux** this is expected and is not your environment: pip cannot resolve
+MinerU's `vllm` dependency tree, and backtracks through cffi source
+distributions indefinitely rather than failing fast. Use uv:
+
+```bash
+pip install uv
+uv pip install -r kindle_math_converter/requirements.txt
+```
+
+Or install the pinned Linux set the Modal image uses, which needs no resolution
+at all:
+
+```bash
+uv pip install -r modal-requirements.txt
+```
+
+On **macOS** the tree resolves under plain pip in seconds, so a failure there is
+a genuine conflict — usually a dirty environment. Start clean:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r kindle_math_converter/requirements.txt
 ```
+
+Do **not** pre-install a CPU-only torch build first, as an earlier version of
+this guide advised. It conflicts with vLLM on Linux, and on Apple Silicon it is
+pointless — the model runs on MLX.
 
 ---
 
@@ -926,14 +1013,24 @@ python main.py convert paper.pdf --no-epubcheck
 
 **Conversion is very slow**
 
-Normal speeds on CPU:
-- 10–30 seconds per page for scanned PDFs (OCR + detection + recognition)
-- 2–5 seconds per page for digital PDFs
-- 5–15 seconds per equation for tectonic rendering
+Normal speed is **~45 s/page** for the MinerU parse on an Apple Silicon GPU,
+which is ~95% of a long run. Equation work adds ~0.6 s per equation reaching
+tectonic.
 
-If it's much slower, check that you're not accidentally running GPU torch
-on a machine that expects CPU. Also check `--verbose` output to see which
-stage is the bottleneck.
+If it is much slower than that, check the engine first — the CPU fallback is
+the usual answer, and it is slow enough to look like a hang:
+
+```bash
+python -c "from mineru.utils.engine_utils import get_vlm_engine; print(get_vlm_engine('auto'))"
+```
+
+`transformers` means MinerU is on CPU and the run will not finish in any useful
+time. Install the platform extra (`mineru[vlm,mlx]` or `mineru[vlm,vllm]`) —
+see [System requirements](#2-system-requirements).
+
+If the engine is right and it is still slow, use `--verbose` to see which stage
+is the bottleneck. Note the second run of a book is much faster than the first:
+completed parse batches and successful LaTeX compiles are both cached.
 
 ---
 
