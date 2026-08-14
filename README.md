@@ -11,6 +11,8 @@ correctly rendered mathematical equations as scalable vector graphics (SVG).
 2. [System requirements](#2-system-requirements)
 3. [Installation](#3-installation)
 4. [Usage](#4-usage)
+   - [Long documents (100+ pages)](#4b-long-documents-100-pages)
+   - [Verifying a parser change](#verifying-a-parser-change)
 5. [Understanding the output files](#5-understanding-the-output-files)
 6. [Configuration reference](#6-configuration-reference)
 7. [The pipeline — what happens inside](#7-the-pipeline--what-happens-inside)
@@ -27,10 +29,14 @@ can't display.
 
 This tool does four things differently:
 
-1. **Detects** every equation on every page using a trained AI model (YOLOv8-MFD).
-2. **Recognises** each equation as LaTeX using another AI model (pix2tex).
-3. **Validates** the result by compiling the LaTeX and comparing the rendered output
-   to the original — equations that look wrong get a repair attempt.
+1. **Reads** each page with a document vision-language model (MinerU), which
+   recovers layout, reading order, text and equations in a single pass — including
+   multi-column flow, headings, tables and footnotes.
+2. **Recognises** every equation as LaTeX, inline ones included, keeping them in
+   place inside their sentences rather than pulling them out as images.
+3. **Validates** each equation by compiling it, and scores how plausible the
+   recognised LaTeX is — equations that fail get a repair attempt, and anything
+   still failing falls back to the page image rather than silently vanishing.
 4. **Renders** each equation to SVG using a real LaTeX engine (tectonic + dvisvgm),
    and embeds it inline in the EPUB — so equations scale with font size, respect
    dark mode, and never appear blurry.
@@ -171,15 +177,26 @@ python main.py convert paper.pdf --no-epubcheck
 python main.py convert --help
 
 Options:
-  --output-dir PATH       Output directory.              [default: ./output]
-  --verbose               Detailed per-equation logging in terminal.
-  --cdm-threshold FLOAT   Quality pass threshold (0–1).  [default: 0.88]
-  --font-size FLOAT       Body font size in pt.          [default: 10.0]
-  --mathpix-id TEXT       Mathpix App ID (optional fallback recogniser).
-  --mathpix-key TEXT      Mathpix App Key.
-  --open-report           Open HTML report in browser on completion.
-  --dump-cache            Write cache contents to JSON for debugging.
-  --no-epubcheck          Skip EPUB validation (if Java unavailable).
+  --output-dir PATH           Output directory.              [default: ./output]
+  --verbose                   Detailed per-equation logging in terminal.
+  --cdm-threshold FLOAT       Quality pass threshold (0–1).  [default: 0.88]
+  --font-size FLOAT           Body font size in pt.          [default: 12.0]
+  --mathpix-id TEXT           Mathpix App ID (optional fallback recogniser).
+  --mathpix-key TEXT          Mathpix App Key.
+  --open-report               Open HTML report in browser on completion.
+  --dump-cache                Write cache contents to JSON for debugging.
+  --no-epubcheck              Skip EPUB validation (if Java unavailable).
+  --fresh-parse               Re-run MinerU even if a cached parse exists.
+  --max-parallel-workers INT  Threads for per-equation work. [default: min(8, cpus)]
+  --parse-batch-size INT      Pages per MinerU invocation.   [default: 50]
+  --mineru-timeout INT        Per-batch timeout in seconds.  [default: derived]
+```
+
+There is also a second command for comparing runs — see
+[Verifying a parser change](#verifying-a-parser-change):
+
+```
+python main.py compare-snapshots BASELINE.json CANDIDATE.json
 ```
 
 ### Re-download models
@@ -215,9 +232,243 @@ If any equations are flagged:
 
 ---
 
+## 4b. Long documents (100+ pages)
+
+MinerU is roughly 86% of a short run's wall clock and ~95% of a long one, at a
+measured **45 seconds per page**. A 500-page textbook is therefore a 6–7 hour
+parse. Three things make that survivable rather than merely slow.
+
+**The parse runs in batches and resumes.** Pages are parsed
+`--parse-batch-size` at a time (default 50), each batch into its own directory
+under `<output>/mineru/batch_XXXXX_XXXXX/` with its own cached result. If a run
+dies at page 480, re-running it reuses every completed batch and only redoes the
+one that failed — minutes lost instead of hours. Nothing special is needed to
+resume: just run the same command again.
+
+**Timeouts scale with the work.** Each batch gets `pages × 120s` (minimum 600s)
+rather than one fixed cap, because a 6-page paper and a 500-page textbook cannot
+share a sensible constant. Override with `--mineru-timeout` if you need to.
+
+**Memory is bounded by batch size, not book length.** Page rasters are written
+to a temp directory and encoded one at a time, and each page's raster is
+released as soon as its equation crops are cut. Peak resident memory on a
+500-page book is ~0.44 GB. (Before this was measured and fixed it was 6.64 GB,
+which does not fit on a 16 GB machine.)
+
+A practical note: iterating on a long book is much cheaper than the first run.
+Successful LaTeX compiles are cached in `<output>/.compile_cache/`, so a second
+run of the same book skips the equation work entirely — measured at 79s → 14s on
+the 6-page reference paper.
+
+### Verifying a parser change
+
+Every run writes `{title}_latex_snapshot.json` containing the recognised LaTeX
+for every equation. `compare-snapshots` diffs two of them exactly:
+
+```bash
+python main.py compare-snapshots old/book_latex_snapshot.json new/book_latex_snapshot.json
+```
+
+Exit code 0 means recognition is unchanged; 1 means review it before accepting.
+
+**This exists because equation counts are not a sufficient check.** The quality
+gate is "does it compile, and does it look plausible" — so an equation that is
+recognised *wrongly* but still compiles passes silently, and at a thousand
+equations nobody finds it by reading. Two optimisations were measured against
+this harness and both were rejected despite being faster and producing zero
+flagged equations and a clean EPUBCheck:
+
+| Change | Speed | What the diff found |
+|---|---|---|
+| `-b hybrid-engine --effort medium` | 15% faster | 37% of equations changed. `SU_{3}` became `^{3}`; footnote markers shifted by one. |
+| 8-bit MLX quantization of the model | 21% faster | 3% changed — including a commutator `\left[ … \right]` turned into a ceiling function `\lceil … \rceil`. |
+
+A third, `--image-analysis false`, left recognition identical but produced no
+measurable speedup, and it drops the figure descriptions used as alt text.
+
+The conclusion: **there is no local speed win available that does not cost
+correctness.** The real bottleneck is that `mlx-vlm` cannot batch — it predicts
+one region at a time — and that is upstream, with no configuration knob. If the
+6–7 hours matters, the answer is to run MinerU somewhere with a batching GPU,
+not to tune it locally.
+
+### Working out what a GPU run costs
+
+> **Rates below were captured on 2026-08-12 and verified against one real
+> invoice on that date. Cloud pricing moves — re-check
+> <https://modal.com/pricing> before relying on these figures, and treat any
+> estimate derived from them as stale after a few months.**
+
+Cost is **not** just the GPU rate. Modal bills the GPU, the CPU cores you request,
+and the memory you request, for every second the container is alive:
+
+```
+$/second = gpu_rate + (cpu_cores x 0.0000131) + (memory_GiB x 0.00000222)
+```
+
+GPU rates per second (as of 2026-08-12): T4 `0.000164`, L4 `0.000222`,
+A10G `0.000306`, L40S `0.000542`, A100-40GB `0.000583`, A100-80GB `0.000694`,
+H100 `0.001097`.
+
+**Requested CPU and memory are a large share of the bill** — not a rounding error.
+For L4 with 8 cores and 16 GiB they are 39% of the total. Sizing them by
+guesswork wastes real money:
+
+| Configuration | $/hour |
+|---|---|
+| L4 + 2 cores + 8 GiB | $0.96 |
+| L4 + 4 cores + 8 GiB | $1.05 |
+| L4 + 8 cores + 16 GiB | $1.30 |
+| A10G + 8 cores + 16 GiB | $1.61 |
+| L40S + 8 cores + 16 GiB | $2.46 |
+
+*(rate card current as of 2026-08-12)*
+
+**What counts as billable seconds:** from container start until the function
+returns. Local upload and download time is not billed. Idle time *is* billed —
+`scaledown_window` keeps a container alive after its last input and defaults to
+**60 seconds**, which you pay for. `modal run` uses an ephemeral app that is torn
+down when the entrypoint exits, so it avoids that tail; a deployed function does
+not, and should set `scaledown_window` low.
+
+Verified against a real invoice: an L4 + 8 core + 16 GiB run with 529 s of work
+billed 552 s and cost **$0.20**, matching the formula to within 4%.
+
+Practical figures at the measured ~3.5 s/page:
+
+| Book | Parse | Cost (L4 + 8 + 16) |
+|---|---|---|
+| 500 pages | ~32 min | ~$0.70 |
+| 1000 pages | ~63 min | ~$1.35 |
+
+### Choosing GPU, CPU and memory (measured 2026-08-12)
+
+Two configurations were measured on the same document, two parses each:
+
+| Config | $/hr | mean s/page | spread | parse cost per 1000 pp |
+|---|---|---|---|---|
+| **L4 + 8 cores + 16 GiB** | 1.30 | 4.1 | **1.05x** | $1.49 |
+| L4 + 4 cores + 8 GiB | 1.05 | 4.8 | 1.71x | $1.39 |
+
+**Use 8 cores and 16 GiB — the decision is reliability, not price.** Halving
+them saves about 7% on the parse, which on a 1000-page book is roughly ten
+cents. In exchange, two identical parses came back 1.7x apart instead of 1.05x.
+Unpredictable throughput is not just annoying: it is what makes a long run's
+duration and cost unquotable, and it is the problem that started this whole
+investigation. A dime is not worth reintroducing it.
+
+**This experiment was flawed — treat the result as a weak signal, not a
+finding.** Three problems, in order of severity:
+
+1. **Two variables moved at once.** CPU went 8 → 4 *and* memory 16 → 8 GiB, so
+   neither can be credited. The more plausible mechanism is actually memory:
+   8 GiB leaves little page cache for a 2.2 GB model plus 300 dpi page rasters,
+   so the slow parse may have been re-reading from the network-backed Volume.
+2. **Two parses per configuration.** Far too few to separate a real effect from
+   ordinary noise.
+3. **The runs landed on different host classes** (24 cores/381 GB versus
+   20/190). Those are the *physical host*, not our slice — `cpu=` and `memory=`
+   are reservations — but a core is not a fixed unit of speed across CPU
+   generations, and neighbours contend for memory bandwidth and the PCIe path to
+   the GPU.
+
+Keeping 8 cores and 16 GiB is the conservative call, not a proven optimum. To
+settle it: change one variable at a time, repeat within a single container (jobs
+in one container share hardware, which controls for placement), and pin
+`region=` so the hardware pool is narrower.
+
+### What varies between runs, and what to do about it
+
+Modal schedules onto whatever worker is free across its fleet, so host specs
+differ run to run. What this means in practice:
+
+| Factor | Under your control? | How |
+|---|---|---|
+| Your CPU/memory slice | **Yes** — it is a reservation | `cpu=`, `memory=` |
+| Host CPU generation | In principle | `region=`/`cloud=` — **but see below** |
+| Noisy neighbours | No | repeat measurements; compare within one container |
+| Engine init cost | **Yes** | larger page batches amortise it |
+
+**Region pinning is deliberately not used.** Modal charges **1.5–1.75x base
+prices** for region selection, which would take this configuration from $1.30/hr
+to $1.95–2.28/hr. That is a 50–75% surcharge to narrow a spread that was never
+isolated in the first place.
+
+It is also largely unnecessary. `cpu=` and `memory=` are *reservations* — your
+slice is the same whichever host you land on — and `gpu=` pins the accelerator
+model. What the host still influences is second-order: which CPU generation
+those cores belong to, and contention with neighbours for memory bandwidth, the
+PCIe path to the GPU, and the network path to the Volume. Let Modal place the
+work wherever it likes and pay base rates.
+
+The runner logs `affinity_cpus` and the cgroup CPU/memory limits — the
+allocation itself — alongside the host CPU model. An earlier version logged only
+`os.cpu_count()` and `/proc/meminfo`, which describe the host and say nothing
+about your slice; that is what made the first timing differences impossible to
+attribute.
+
+GPU choice is firmer. L4 matched A10G's best observed throughput at 27% lower
+cost, so A10G buys nothing here. **Do not use T4** at any price: its compute
+capability is 7.5, below the 8.0 threshold at which MinerU enables custom logits
+processors, so it silently takes a different code path and changes recognition.
+
+The larger lever is **batch size, not resources.** Engine startup costs 69–145 s
+per `mineru` invocation, so it dominates short jobs and vanishes on long ones —
+on a 6-page paper it is most of the run; across a 250-page batch it adds ~7%.
+Prefer large page batches, bounded by how much work you are willing to redo if
+one fails.
+
+### Detecting a stuck remote parse
+
+A wall-clock timeout is the wrong instrument for this: short enough to catch a
+hang quickly and it kills a legitimately long book; long enough for 1000 pages
+and a hang burns hours of rented GPU first.
+
+So the remote runner watches **progress**, not elapsed time and not merely
+output. MinerU prints a tqdm counter (`94/197`), and the watchdog requires that
+counter to *advance*. This matters because a process can keep printing while the
+work behind it is wedged — a redrawing bar or a heartbeat log is
+indistinguishable from progress unless you read the number. Silence is only the
+easy case.
+
+Before any counter exists (engine startup prints plenty and counts nothing) it
+falls back to time-since-output, which is the right measure for that phase. A
+health line every 60 s reports the current counter and seconds since it last
+moved. The function timeout remains only as a backstop that should never fire.
+
+Consequence: a 700-page book that wedges at page 562 costs one stall window,
+not the remainder of the run — and batches already committed survive it.
+
+### Local runs are reproducible; GPU runs are not
+
+Running the same document twice locally produces identical output. The Apple
+Silicon path (`mlx-engine`) predicts one region at a time, and MinerU requests
+greedy decoding (`temperature=0.0, top_k=1`), so the result is deterministic.
+
+**A CUDA GPU running `vllm-engine` is not deterministic.** Measured on the same
+PDF, same pinned package set, same model, two consecutive runs: **2 of 153
+equations differed.** This is not a sampling setting that can be corrected —
+MinerU already requests greedy decoding on every backend. It is a property of
+vLLM's batched execution: batch composition changes the order of floating-point
+reductions, so identical greedy requests can resolve to different tokens
+depending on how the scheduler grouped them.
+
+Practical consequences:
+
+- Converting the same book twice on a GPU yields two slightly different EPUBs.
+  For reading a book once, this does not matter. For reproducing someone else's
+  output exactly, it cannot be relied upon — pinning package versions does not
+  make it reproducible.
+- Snapshot comparison against a GPU-produced baseline carries ~2% noise. Treat
+  small diffs as inconclusive rather than as a regression.
+
+Design around it rather than trying to fix it.
+
+---
+
 ## 5. Understanding the output files
 
-Every conversion produces four files in the output directory
+Every conversion produces five files in the output directory
 (default `./output/`):
 
 ### `{title}.epub`
@@ -232,7 +483,10 @@ Open this in any browser. It contains:
 
 - A summary table of every pipeline stage (duration, status, any errors).
 - A searchable, sortable table of every equation in the document showing:
-  - The source image crop (what the equation looked like in the original).
+  - The source image crop, for equations that did not pass cleanly. Crops are
+    ~20–100 KB each, so embedding one per equation would make a large book's
+    report hundreds of megabytes; equations that passed the gate show a note
+    instead.
   - The recognised LaTeX.
   - The CDM quality score (how closely the rendered SVG matches the original).
   - The confidence gate: **pass**, **repaired**, **fallback**, or **flagged**.
@@ -245,6 +499,13 @@ Use this file to diagnose any quality issues.
 
 Machine-readable summary of the pipeline run — useful if you want to script
 batch processing or check results programmatically.
+
+### `{title}_latex_snapshot.json`
+
+The recognised LaTeX for every equation, keyed by page and reading order. Used
+by `compare-snapshots` to prove a parser change did not alter recognition — see
+[Verifying a parser change](#verifying-a-parser-change). Also useful on its own
+for grepping what the recogniser actually produced for a given equation.
 
 ### `{title}_pipeline.log`
 

@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from ..cache.equation_cache import PersistentCompileCache
 from ..concurrency import parallel_for_each
 from ..models.document import Document, EquationRegion, FailureReason
 from ..models.enums import ConfidenceGate, ErrorCode, FormulaClass
@@ -207,6 +208,68 @@ def _build_latex_wrapper(latex: str, formula_class: FormulaClass) -> str:
 # ---------------------------------------------------------------------------
 # Compilation helpers
 # ---------------------------------------------------------------------------
+
+# Set once by run() before the thread pool starts, read by _compile_to_xdv.
+# A module-level handle keeps the cache out of the signature of the three
+# functions between run() and the compile, none of which otherwise care.
+_compile_cache: PersistentCompileCache = PersistentCompileCache(None)
+
+
+def _compile_to_xdv(
+    latex: str,
+    formula_class: FormulaClass,
+    timeout: int = 45,
+) -> tuple[bytes | None, str]:
+    """
+    Compiles LaTeX to XDV via tectonic — the compile check for Track B.
+    Returns (xdv_bytes, stderr_description); stderr is empty on success.
+
+    Track B only needs to know whether the LaTeX compiles, so this replaces
+    the PDF build plus pymupdf rasterize that `_compile_to_png` does: the PNG
+    it produced was discarded. XDV is also exactly what s08a needs to make the
+    SVG, so keeping the bytes lets that stage skip recompiling the identical
+    .tex — the two stages share `_build_latex_wrapper`, so it really is the
+    same input.
+    """
+    cached = _compile_cache.get(latex, formula_class.value)
+    if cached is not None:
+        return cached, ""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        work = Path(tmpdir)
+        tex_file = work / "equation.tex"
+        tex_file.write_text(_build_latex_wrapper(latex, formula_class), encoding="utf-8")
+
+        try:
+            import shutil as _shutil
+            _tectonic = (
+                _shutil.which("tectonic")
+                or next((p for p in ("/opt/homebrew/bin/tectonic", "/usr/local/bin/tectonic") if Path(p).exists()), "tectonic")
+            )
+            proc = subprocess.run(
+                [_tectonic, "--outfmt=xdv", str(tex_file)],
+                capture_output=True,
+                timeout=timeout,
+                cwd=work,
+            )
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+                return None, stderr or "tectonic exited non-zero"
+
+            xdv_path = work / "equation.xdv"
+            if not xdv_path.exists():
+                return None, "tectonic produced no XDV"
+            xdv = xdv_path.read_bytes()
+            _compile_cache.put(latex, formula_class.value, xdv)
+            return xdv, ""
+
+        except subprocess.TimeoutExpired:
+            return None, "tectonic timeout"
+        except FileNotFoundError:
+            return None, "tectonic not found — install via: brew install tectonic"
+        except Exception as exc:
+            return None, str(exc)
+
 
 def _compile_to_png(
     latex: str,
@@ -414,10 +477,14 @@ def _plausibility_score(latex: str) -> float:
 def _validate_scanned(
     latex: str,
     region: EquationRegion,
-) -> tuple[ConfidenceGate, FailureReason | None]:
+) -> tuple[ConfidenceGate, FailureReason | None, bytes | None]:
     """
     Track B validation: compile check + plausibility score.
     Sets region.cdm_score to the plausibility value (used by report).
+
+    Returns the compiled XDV alongside the verdict rather than writing it to
+    the region: the repair loop calls this with candidate LaTeX that may be
+    rejected, and only the caller knows which candidate won.
     """
     # Guard: skip if crop is implausibly small (detection artifact)
     if region.source_image_crop:
@@ -433,12 +500,13 @@ def _validate_scanned(
                     stage="s06_validation",
                     detail=f"Crop too small ({w}×{h} px) — likely a detection artifact",
                     recoverable=False,
-                )
+                ), None
         except Exception:
             pass
 
-    # Compile check (binary pass/fail)
-    _, stderr = _compile_to_png(latex, region.formula_class)
+    # Compile check (binary pass/fail). The XDV comes back to the caller for
+    # s08a to reuse — see _compile_to_xdv.
+    xdv, stderr = _compile_to_xdv(latex, region.formula_class)
     if stderr:
         sub_code, detail = _classify_tectonic_error(stderr, latex)
         region.cdm_score = 0.0
@@ -448,14 +516,14 @@ def _validate_scanned(
             stage="s06_validation",
             detail=detail,
             recoverable=sub_code in (ErrorCode.CDM_UNDEFINED_CMD.value, ErrorCode.CDM_BRACE_MISMATCH.value),
-        )
+        ), None
 
     # Plausibility scoring
     score = _plausibility_score(latex)
     region.cdm_score = score
 
     if score >= 0.65:
-        return ConfidenceGate.PASS, None
+        return ConfidenceGate.PASS, None, xdv
     elif score >= 0.40:
         return ConfidenceGate.REPAIR, FailureReason(
             code=ErrorCode.CDM_RENDER_FAILED.value,
@@ -463,7 +531,7 @@ def _validate_scanned(
             stage="s06_validation",
             detail=f"Plausibility {score:.2f} — compiled OK but recognition uncertain",
             recoverable=True,
-        )
+        ), xdv
     else:
         return ConfidenceGate.FALLBACK, FailureReason(
             code=ErrorCode.CDM_RENDER_FAILED.value,
@@ -471,7 +539,7 @@ def _validate_scanned(
             stage="s06_validation",
             detail=f"Plausibility {score:.2f} — recognition likely failed",
             recoverable=False,
-        )
+        ), xdv
 
 
 # ---------------------------------------------------------------------------
@@ -537,11 +605,20 @@ def _validate_region(
     # The row-break fix runs here too, not just in the repair loop: without it
     # the first compile fails outright and the equation burns repair attempts
     # on a problem that has one deterministic answer.
-    latex = _fix_row_break_bracket(_apply_unicode_substitutions(region.raw_latex))
+    #
+    # Normalisation is applied up front rather than only at the end. It is
+    # whitespace and comment handling that TeX itself discards, so the compile
+    # is unaffected — but it means the gate compiles the *same string* s08a
+    # later renders, which is what lets s08a reuse the XDV instead of running
+    # tectonic a second time. normalize_latex is idempotent, so the final
+    # `region.normalized_latex = normalize_latex(latex)` still holds.
+    latex = normalize_latex(
+        _fix_row_break_bracket(_apply_unicode_substitutions(region.raw_latex))
+    )
 
     # ── TRACK B — scanned source ─────────────────────────────────────
     if is_scanned:
-        gate, fr = _validate_scanned(latex, region)
+        gate, fr, xdv = _validate_scanned(latex, region)
 
         # Repair loop: try structural repairs if not already PASS
         attempts = 0
@@ -549,17 +626,23 @@ def _validate_region(
             repaired_latex = _apply_repair_rules(latex)
             if repaired_latex == latex:
                 break  # rules produced no change
-            new_gate, new_fr = _validate_scanned(repaired_latex, region)
+            new_gate, new_fr, new_xdv = _validate_scanned(repaired_latex, region)
             if _GATE_RANK[new_gate] < _GATE_RANK[gate]:
                 latex = repaired_latex
                 gate = new_gate
                 fr = new_fr
+                xdv = new_xdv
                 region.repair_attempts += 1
             attempts += 1
 
         region.normalized_latex = normalize_latex(latex)
         region.confidence_gate = gate
         region.failure_reason = fr
+        # Hand the accepted compile to s08a, tagged with the exact string it
+        # came from. A rejected repair candidate never lands here, and s08a
+        # only reuses the XDV when that string matches what it is rendering.
+        region.compiled_xdv = xdv
+        region.compiled_xdv_latex = latex if xdv else None
 
         if gate == ConfidenceGate.PASS:
             return {
@@ -670,7 +753,10 @@ def run(
     max_repair_attempts: int = 2,
     cdm_method: str = "ssim",
     max_parallel_workers: int | None = None,
+    compile_cache_dir: Path | None = None,
 ) -> tuple[Document, StageResult]:
+    global _compile_cache
+    _compile_cache = PersistentCompileCache(compile_cache_dir)
     t0 = time.perf_counter()
     stage = "s06_validation"
     warnings: list[str] = []

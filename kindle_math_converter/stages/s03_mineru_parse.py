@@ -32,6 +32,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -81,12 +82,59 @@ def _find_middle_json(work_dir: Path, pdf_stem: str) -> Optional[Path]:
     return matches[0] if matches else None
 
 
+def _page_batches(total_pages: int, batch_size: int) -> list[tuple[int, int]]:
+    """Splits the document into 0-based inclusive [start, end] page ranges.
+
+    A batch_size of 0 (or one that covers the document) yields a single range,
+    which is exactly the pre-batching behaviour.
+    """
+    if batch_size <= 0 or total_pages <= batch_size:
+        return [(0, max(0, total_pages - 1))]
+    return [
+        (start, min(start + batch_size - 1, total_pages - 1))
+        for start in range(0, total_pages, batch_size)
+    ]
+
+
+def _batch_timeout(pages: int, timeout_s: Optional[int], per_page_s: int) -> int:
+    """Timeout for one batch. Derived from page count unless overridden.
+
+    A fixed cap is the wrong shape here: 50 pages at the observed 55 s/page is
+    already 46 min, and region density (not page count) drives the content
+    pass, so a dense page can overrun any constant. The floor covers MinerU's
+    ~10 s fixed start-up on tiny batches.
+    """
+    if timeout_s:
+        return timeout_s
+    return max(600, pages * per_page_s)
+
+
+def _load_pdf_info(middle_path: Path, page_offset: int) -> list[dict]:
+    """Reads one middle.json and re-bases its page indices onto the document.
+
+    MinerU numbers pages *within the range it was given*: `-s 50 -e 99` still
+    reports page_idx 0,1,2… Without this offset every batch after the first
+    would overwrite the first batch's pages — silently, and with plausible
+    looking output.
+    """
+    with open(middle_path) as f:
+        middle = json.load(f)
+    pages = middle.get("pdf_info", [])
+    if page_offset:
+        for page_info in pages:
+            page_info["page_idx"] = page_info.get("page_idx", 0) + page_offset
+    return pages
+
+
 def _invoke_mineru(
     source_pdf: str,
     work_dir: Path,
     backend: str,
     timeout_s: int,
     bus: EventBus,
+    start_page: Optional[int] = None,
+    end_page: Optional[int] = None,
+    image_analysis: bool = True,
 ) -> None:
     mineru_bin = Path(sys.executable).parent / "mineru"
     if not mineru_bin.exists():
@@ -95,6 +143,14 @@ def _invoke_mineru(
         )
     work_dir.mkdir(parents=True, exist_ok=True)
     cmd = [str(mineru_bin), "-p", source_pdf, "-o", str(work_dir), "-b", backend]
+    if start_page is not None and end_page is not None:
+        # -s/-e are 0-based and inclusive.
+        cmd += ["-s", str(start_page), "-e", str(end_page)]
+    if not image_analysis:
+        # Skips the VLM's per-figure description pass. Measured as no gain on a
+        # figure-sparse paper, but the work scales with figure count, so it is
+        # worth having for image-heavy books. Costs FigureBlock.alt_text.
+        cmd += ["--image-analysis", "false"]
     env = dict(os.environ, PYTHONUNBUFFERED="1")
     log_path = work_dir / "mineru.log"
     bus.emit(STAGE, "mineru_invoke", backend=backend, log=str(log_path))
@@ -225,9 +281,19 @@ def run(
     source_pdf: str,
     work_dir: Path,
     backend: str = "vlm-engine",
-    timeout_s: int = 3600,
+    timeout_s: Optional[int] = None,
     reuse_existing: bool = True,
+    batch_size: int = 50,
+    timeout_per_page_s: int = 120,
+    image_analysis: bool = True,
 ) -> tuple[Document, StageResult]:
+    """Parses `source_pdf` with MinerU and maps the result onto `document`.
+
+    The parse runs in page-range batches, each into its own subdirectory with
+    its own cached middle.json. That is what makes a long book resumable: a
+    crash or timeout in batch 7 leaves batches 1–6 on disk, and a re-run picks
+    up from there instead of starting a six-hour parse again.
+    """
     t0 = time.perf_counter()
     warnings: list[str] = []
     errors: list[str] = []
@@ -235,34 +301,75 @@ def run(
     bus.emit(STAGE, "stage_start")
     log.info("stage_start", source=source_pdf, backend=backend)
 
-    pdf_stem = Path(source_pdf).stem
-    middle_path = _find_middle_json(work_dir, pdf_stem) if reuse_existing else None
-    if middle_path is not None:
-        bus.emit(STAGE, "mineru_reused", middle_json=str(middle_path))
-        log.info("mineru_reused", middle_json=str(middle_path))
-    else:
-        try:
-            _invoke_mineru(source_pdf, work_dir, backend, timeout_s, bus)
-        except (RuntimeError, subprocess.TimeoutExpired) as exc:
-            errors.append(str(exc))
-            log.error("mineru_failed", error=str(exc))
-            return document, StageResult(
-                stage_name=STAGE, ok=False,
-                duration_ms=round((time.perf_counter() - t0) * 1000, 2),
-                warnings=warnings, errors=errors,
-            )
-        middle_path = _find_middle_json(work_dir, pdf_stem)
-        if middle_path is None:
-            errors.append(f"mineru produced no middle.json under {work_dir}")
-            return document, StageResult(
-                stage_name=STAGE, ok=False,
-                duration_ms=round((time.perf_counter() - t0) * 1000, 2),
-                warnings=warnings, errors=errors,
-            )
+    def _failed() -> tuple[Document, StageResult]:
+        return document, StageResult(
+            stage_name=STAGE, ok=False,
+            duration_ms=round((time.perf_counter() - t0) * 1000, 2),
+            warnings=warnings, errors=errors,
+        )
 
-    with open(middle_path) as f:
-        middle = json.load(f)
-    pdf_info = middle.get("pdf_info", [])
+    pdf_stem = Path(source_pdf).stem
+    total_pages = len(document.pages)
+
+    # A whole-document middle.json sitting directly under work_dir is honoured
+    # as-is. That covers parses made before batching existed, and — the reason
+    # it matters — parses produced somewhere else entirely (a GPU box, the
+    # hosted API) and dropped in. This is the external-compute seam.
+    whole_doc_parse = _find_middle_json(work_dir, pdf_stem) if reuse_existing else None
+
+    pdf_info: list[dict] = []
+    if whole_doc_parse is not None:
+        bus.emit(STAGE, "mineru_reused", middle_json=str(whole_doc_parse))
+        log.info("mineru_reused", middle_json=str(whole_doc_parse))
+        pdf_info = _load_pdf_info(whole_doc_parse, page_offset=0)
+    else:
+        batches = _page_batches(total_pages, batch_size)
+        for batch_no, (start, end) in enumerate(batches, 1):
+            n_pages = end - start + 1
+            # Each batch owns a subdirectory. MinerU always writes to
+            # <out>/<stem>/vlm/<stem>_middle.json, so batches sharing one
+            # directory would overwrite each other and _find_middle_json would
+            # return whichever survived.
+            batch_dir = work_dir / f"batch_{start:05d}_{end:05d}"
+            middle_path = _find_middle_json(batch_dir, pdf_stem) if reuse_existing else None
+
+            if middle_path is not None:
+                bus.emit(STAGE, "mineru_batch_reused", batch=batch_no,
+                         first_page=start + 1, last_page=end + 1)
+                log.info("mineru_batch_reused", batch=f"{batch_no}/{len(batches)}",
+                         pages=f"{start + 1}-{end + 1}")
+            else:
+                bus.emit(STAGE, "mineru_batch_start", batch=batch_no,
+                         batches=len(batches), first_page=start + 1, last_page=end + 1)
+                log.info("mineru_batch_start", batch=f"{batch_no}/{len(batches)}",
+                         pages=f"{start + 1}-{end + 1}")
+                # Start from an empty directory. --fresh-parse is used exactly
+                # when the existing parse is suspect, so re-invoking MinerU on
+                # top of its own previous output — which it may or may not
+                # overwrite wholesale — is the one thing that must not happen.
+                if batch_dir.exists():
+                    shutil.rmtree(batch_dir, ignore_errors=True)
+                try:
+                    _invoke_mineru(
+                        source_pdf, batch_dir, backend,
+                        _batch_timeout(n_pages, timeout_s, timeout_per_page_s),
+                        bus, start_page=start, end_page=end,
+                        image_analysis=image_analysis,
+                    )
+                except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                    errors.append(
+                        f"mineru failed on batch {batch_no}/{len(batches)} "
+                        f"(pages {start + 1}-{end + 1}): {exc}"
+                    )
+                    log.error("mineru_failed", batch=batch_no, error=str(exc))
+                    # Completed batches stay on disk — re-running resumes here.
+                    return _failed()
+                middle_path = _find_middle_json(batch_dir, pdf_stem)
+                if middle_path is None:
+                    errors.append(f"mineru produced no middle.json under {batch_dir}")
+                    return _failed()
+
+            pdf_info.extend(_load_pdf_info(middle_path, page_offset=start))
 
     if len(pdf_info) != len(document.pages):
         warnings.append(
@@ -512,6 +619,13 @@ def run(
 
         if page_img is not None:
             page_img.close()
+
+        # Release the full-page raster now that every crop for this page has
+        # been cut. s03 is the only reader of Page.image_bytes — downstream
+        # stages work from the much smaller per-region crops — so holding it
+        # would make resident memory scale with book length for nothing
+        # (~0.5–1.25 MB/page, i.e. 0.25–0.6 GB on a 500-page book).
+        page.image_bytes = None
 
     # D1 dedup by recognized LaTeX: canonical region gets the SVG in s08a,
     # duplicates copy it and are re-namespaced in s09.

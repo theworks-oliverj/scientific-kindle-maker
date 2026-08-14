@@ -185,7 +185,18 @@ def _render_region(
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             work = Path(tmpdir)
-            xdv_path = latex_to_xdv(latex, region.formula_class, work, tectonic_timeout)
+            # s06's gate already compiled this .tex (both stages build it with
+            # s06's _build_latex_wrapper) and kept the XDV. Reuse it rather
+            # than paying for a second identical tectonic run — but only when
+            # it was compiled from the very string being rendered here.
+            # `latex` is normalized_latex, which can differ from what s06
+            # compiled, so this equality is the safety property: a mismatch
+            # costs a compile, never a wrong equation.
+            if region.compiled_xdv and region.compiled_xdv_latex == latex:
+                xdv_path = work / "equation.xdv"
+                xdv_path.write_bytes(region.compiled_xdv)
+            else:
+                xdv_path = latex_to_xdv(latex, region.formula_class, work, tectonic_timeout)
             svg = xdv_to_svg(xdv_path, work, dvisvgm_timeout)
 
         region.svg = svg
@@ -354,8 +365,15 @@ def run(
             bus.emit(stage, "equation_ok", equation_id=region.region_id, source="dedup_copy")
 
     duration_ms = round((time.perf_counter() - t0) * 1000, 2)
-    bus.emit(stage, "stage_end", rendered=rendered, cache_hits=cache_hits, failed=len(failed_list), dedup_copies=dedup_copies)
-    log.info("stage_end", rendered=rendered, cache_hits=cache_hits, failed=len(failed_list), dedup_copies=dedup_copies)
+    # How many renders skipped a redundant tectonic run by reusing s06's
+    # compile. A low number means normalization is changing the LaTeX between
+    # the two stages and the saving is not being realised.
+    xdv_reused = sum(
+        1 for region, latex in to_render
+        if region.compiled_xdv and region.compiled_xdv_latex == latex
+    )
+    bus.emit(stage, "stage_end", rendered=rendered, cache_hits=cache_hits, failed=len(failed_list), dedup_copies=dedup_copies, xdv_reused=xdv_reused)
+    log.info("stage_end", rendered=rendered, cache_hits=cache_hits, failed=len(failed_list), dedup_copies=dedup_copies, xdv_reused=xdv_reused)
 
     rendered_list = [r for r in pass_list if r.svg is not None]
     return rendered_list, failed_list, StageResult(
@@ -367,6 +385,7 @@ def run(
         metrics={
             "rendered": rendered,
             "cache_hits": cache_hits,
+            "xdv_reused": xdv_reused,
             "failed": len(failed_list),
             "dedup_copies": dedup_copies,
         },

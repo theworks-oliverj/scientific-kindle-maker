@@ -51,8 +51,20 @@ class PipelineConfig:
     max_repair_attempts: int = 2
     # MinerU (replaces old s03–s05b for PDF sources)
     mineru_backend: str = "vlm-engine"
-    mineru_timeout_s: int = 3600
+    # Pages per MinerU invocation. Batching is what makes a long book
+    # resumable — a failure costs one batch, not the whole parse. Documents
+    # at or under one batch behave exactly as they did before.
+    mineru_batch_size: int = 50
+    # Per-batch timeout is derived from its page count unless mineru_timeout_s
+    # is set explicitly. A single fixed cap cannot fit both a 6-page paper and
+    # a 500-page textbook.
+    mineru_timeout_per_page_s: int = 120
+    mineru_timeout_s: Optional[int] = None
     mineru_reuse_existing: bool = True
+    # MinerU's per-figure description pass. Its cost scales with figure count —
+    # no measurable gain on a figure-sparse paper, potentially real on an
+    # image-heavy book. Disabling it drops FigureBlock.alt_text.
+    mineru_image_analysis: bool = True
     # Fallback
     mathpix_app_id: Optional[str] = None
     mathpix_app_key: Optional[str] = None
@@ -123,6 +135,12 @@ class Pipeline:
                 build_report(result, document, self.bus, report_path)
                 from .stages.s11_output import write_result_json
                 write_result_json(result, out_dir, stem)
+                # Recognition snapshot — the only artefact that can prove a
+                # parser change did not silently alter equation *contents*.
+                # Written on failed runs too: a partial parse is still worth
+                # diffing against.
+                from .qa.latex_snapshot import write_snapshot
+                write_snapshot(document, out_dir, stem)
             except Exception as exc:
                 log.error("report_generation_failed", error=str(exc))
 
@@ -170,6 +188,9 @@ class Pipeline:
                 backend=cfg.mineru_backend,
                 timeout_s=cfg.mineru_timeout_s,
                 reuse_existing=cfg.mineru_reuse_existing,
+                batch_size=cfg.mineru_batch_size,
+                timeout_per_page_s=cfg.mineru_timeout_per_page_s,
+                image_analysis=cfg.mineru_image_analysis,
             )
             result.stage_results.append(sr3)
             if not sr3.ok:
@@ -184,6 +205,10 @@ class Pipeline:
             max_repair_attempts=cfg.max_repair_attempts,
             cdm_method=cfg.cdm_method,
             max_parallel_workers=cfg.max_parallel_workers,
+            # Lives in the output dir so it is scoped to this book and gets
+            # cleaned up with it. Re-running a long book then costs no
+            # tectonic compiles for equations that already succeeded.
+            compile_cache_dir=out_dir / ".compile_cache",
         )
         result.stage_results.append(sr6)
 

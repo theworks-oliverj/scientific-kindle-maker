@@ -70,6 +70,17 @@ class EquationRegion:
     render_as_text: bool = False               # Set in Stage 5B: simple enough to render as HTML text
     inline_text_repr: Optional[str] = None     # Set in Stage 5B: HTML text repr when render_as_text
     footnote_ref_id: Optional[str] = None      # Set in Stage 3: this "^{N}" marks footnote <id>, linked in s10
+    # Set in Stage 6: the XDV from the compile the gate accepted. Stage 8A
+    # renders SVG from this instead of compiling the identical .tex a second
+    # time (both stages build the wrapper with s06's _build_latex_wrapper).
+    # A few KB per equation; ~20 MB across a 2000-equation book.
+    compiled_xdv: Optional[bytes] = None
+    # The exact LaTeX compiled_xdv was produced from. s08A renders
+    # normalized_latex, which is not always the string s06 compiled (a
+    # rejected repair, or normalization that stripped a comment), so reuse is
+    # gated on this matching rather than assumed — a mismatch just means s08A
+    # compiles as it always did, never that it renders the wrong equation.
+    compiled_xdv_latex: Optional[str] = None
 
 
 @dataclass
