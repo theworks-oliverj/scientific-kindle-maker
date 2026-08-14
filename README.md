@@ -7,17 +7,75 @@ correctly rendered mathematical equations as scalable vector graphics (SVG).
 
 ## Table of Contents
 
+0. [Quick start](#0-quick-start) — **start here for a normal book run**
 1. [How it works — the short version](#1-how-it-works--the-short-version)
 2. [System requirements](#2-system-requirements)
 3. [Installation](#3-installation)
 4. [Usage](#4-usage)
    - [Long documents (100+ pages)](#4b-long-documents-100-pages)
+   - [Running the parse on a GPU](#running-the-parse-on-a-gpu)
    - [Verifying a parser change](#verifying-a-parser-change)
 5. [Understanding the output files](#5-understanding-the-output-files)
 6. [Configuration reference](#6-configuration-reference)
 7. [The pipeline — what happens inside](#7-the-pipeline--what-happens-inside)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Known limitations](#9-known-limitations)
+
+---
+
+## 0. Quick start
+
+Everything needed to convert a book, assuming installation is already done.
+Run all commands from the project root.
+
+### A paper or short document
+
+```bash
+python main.py convert "path/to/paper.pdf" --output-dir ~/Desktop/KindleReads/Paper
+```
+
+The EPUB lands at `~/Desktop/KindleReads/Paper/{title}.epub`. A 6-page paper
+takes about five minutes; a 14-page one about ten.
+
+### A book (100+ pages) — parse on a GPU first
+
+Parsing locally runs at ~45 s/page, so a 480-page book is a 6-hour parse. Renting
+a GPU for that one stage turns it into ~30 minutes for well under a dollar. The
+rest of the pipeline still runs on your machine.
+
+**Step 1 — parse remotely. One book per command.**
+
+```bash
+BOOK=~/Desktop/KindleReads/Hartmann
+modal run modal_app.py --pdf "path/to/book.pdf" --output-root "$BOOK" --batch-pages 250
+```
+
+**Step 2 — build the EPUB locally. Same directory, same batch size.**
+
+```bash
+python main.py convert "path/to/book.pdf" --output-dir "$BOOK" --parse-batch-size 250
+```
+
+`--parse-batch-size` **must** equal `--batch-pages` — those numbers are what the
+batch directory names encode, and if they disagree the local run silently
+re-parses the whole book itself at 45 s/page. Step 1 verifies its own output and
+prints the exact step 2 command; copy that rather than retyping it.
+
+### Five things worth knowing
+
+- **Re-running is cheap.** Completed batches and successful LaTeX compiles are
+  cached under the output directory, so a second run skips both. If a remote
+  batch failed, just run step 1 again — it fills in only what is missing.
+- **Confirm the parse was reused.** Step 2 should log `mineru_batch_reused`
+  within its first seconds. If it logs `mineru_batch_start` instead, it is
+  parsing locally — stop it and check the batch size matches.
+- **Cost.** ~$1.30/hour on the default L4. A 500-page book is roughly $0.70.
+  Set a spend limit in the Modal dashboard; nothing here enforces one.
+- **GPU parses are not reproducible.** The same book parsed twice on a GPU gives
+  ~2% different equations. Fine for reading, not for exact reproduction —
+  see [Local runs are reproducible; GPU runs are not](#local-runs-are-reproducible-gpu-runs-are-not).
+- **Everything is checked at the end.** `epubcheck` runs automatically and is
+  fatal, so a completed run means a structurally valid EPUB.
 
 ---
 
@@ -117,19 +175,18 @@ This takes a few minutes. If you see any red error lines, see
 python main.py download-models
 ```
 
-This downloads ~2–4 GB of model weights on the first run and caches them in
-`~/.kindle_converter/models/`. Subsequent runs skip the download entirely.
+This downloads MinerU's ~2.3 GB model (`opendatalab/MinerU2.5-Pro-2605-1.2B`)
+and caches it in `~/.cache/huggingface/`. Subsequent runs skip the download.
 
-Expected output:
+The step is optional — the first `convert` downloads the model automatically.
+Doing it separately just gets the wait out of the way.
+
+If the download stalls (commonly on a VPN, which breaks HuggingFace's Xet
+transfer protocol):
+
+```bash
+HF_HUB_DISABLE_XET=1 python main.py download-models
 ```
-Downloading model weights
-  Cache dir: /Users/you/.kindle_converter/models
-
-  Loaded:  layout, formula, pix2tex, paddleocr
-```
-
-If any model shows as "Missing", see
-[Troubleshooting → Model download failures](#model-download-failures).
 
 ---
 
@@ -291,6 +348,54 @@ correctness.** The real bottleneck is that `mlx-vlm` cannot batch — it predict
 one region at a time — and that is upstream, with no configuration knob. If the
 6–7 hours matters, the answer is to run MinerU somewhere with a batching GPU,
 not to tune it locally.
+
+### Running the parse on a GPU
+
+`modal_app.py` runs the MinerU stage on a rented GPU and brings the result back.
+It is deliberately standalone: it imports nothing from `kindle_math_converter`,
+nothing imports it, and deleting the file returns the project to a purely local
+tool. Requires a Modal account (`pip install modal && modal setup`).
+
+```bash
+modal run modal_app.py --pdf "path/to/book.pdf" \
+    --output-root ~/Desktop/KindleReads/Book --batch-pages 250
+```
+
+**`--output-root` is the pipeline's `--output-dir`.** The results are written
+into the exact layout `s03` looks for, so the local run finds the parse and skips
+MinerU with nothing to move by hand:
+
+```
+<output-dir>/mineru/batch_00000_00249/<stem>/vlm/<stem>_middle.json
+<output-dir>/mineru/batch_00250_00480/<stem>/vlm/<stem>_middle.json
+```
+
+Whole-document parses (no `--batch-pages`) are written as
+`<output-dir>/mineru/<stem>/vlm/…` instead, which `s03` also reads.
+
+**The batch sizes must match.** A directory name encodes the page range it holds,
+and `s03` re-bases each batch's page numbers by the offset that name carries. Two
+consequences, both important:
+
+- Give the local run a *different* `--parse-batch-size` and it looks for
+  directories that do not exist, finds nothing, and re-parses the entire book
+  locally — hours, with no error, presenting only as slowness. The remote run
+  therefore re-derives the expected directory list from the page count, checks
+  what it actually wrote, and prints the matching local command.
+- Assembling these directories by hand is how a batch's equations end up attached
+  to another batch's pages. That is why the runner writes them itself.
+
+**One book per invocation, in this layout.** Directories are keyed on page range
+alone, so a second book — or a second parse of the same book — would land on top
+of the first. `--repeat` and `--pages` are refused here for the same reason, and
+`--repeat` most of all: its only purpose is giving `compare-snapshots` a second
+parse to diff, and if the second overwrote the first, that check would compare a
+file with itself and report "identical" forever. Use `--layout labelled` for
+those, which writes one directory per job and expects you to place the results
+yourself.
+
+Failed batches are not fatal. Each one commits to a Modal Volume as it finishes,
+so re-running the same command fills in only what is missing.
 
 ### Working out what a GPU run costs
 
@@ -559,13 +664,17 @@ python main.py convert paper.pdf --mathpix-id your_id --mathpix-key your_key
 
 ### Model weights location
 
-By default, weights are stored in `~/.kindle_converter/models/`.
-Override with an environment variable:
+MinerU's model is fetched by `huggingface_hub` and lives in its standard cache,
+`~/.cache/huggingface/` (~2.3 GB). Relocate it the usual way:
 
 ```bash
-export KINDLE_CONVERTER_MODELS_DIR=/Volumes/ExternalDrive/models
+export HF_HOME=/Volumes/ExternalDrive/huggingface
 python main.py download-models
 ```
+
+To point MinerU at a *different* model (a quantized build, say), set
+`MINERU_MODEL_SOURCE=local` and add `models-dir.vlm` to `~/mineru.json`. Back
+that file up first — MinerU rewrites it.
 
 ---
 
@@ -583,43 +692,39 @@ Stage 1 — Classifier
     ► Fatal if the file is encrypted, empty, or unrecognised format.
     │
     ▼
-Stage 2 — Extraction  (three variants)
-    2A Digital PDF:  Extracts text blocks and their positions via PyMuPDF.
-    2B Scanned PDF:  Rasterises each page to a 300 DPI grayscale image.
-    2C EPUB/HTML:    Parses MathML elements and equation images from HTML.
+Stage 2 — Extraction  (two variants)
+    2B PDF:        Rasterises every page to a 300 DPI image, written to a
+                   temp directory and decoded one at a time. ALL PDFs take
+                   this path — born-digital ones included.
+    2C EPUB/HTML:  Parses MathML elements and equation images from HTML.
     │
     ▼
-Stage 3 — Detection
-    Runs YOLOv8-MFD on each page image. Draws a bounding box around every
-    equation. Classifies each as inline (within a sentence) or display
-    (its own centred line). Crops and stores each equation image.
-    ► Fatal if the model cannot run at all.
+Stage 3 — MinerU parse  (PDF only)
+    One vision-language pass over the pages, as a subprocess, in batches of
+    --parse-batch-size. Recovers layout, reading order, body text, tables,
+    figures and equations together — inline equations stay in place inside
+    their sentences as [[EQ:id]] placeholders. Footnotes are recovered from
+    MinerU's discarded blocks. Equation crops are re-cut from the Stage 2B
+    raster.
+    Reuses any parse already on disk, which is what makes a GPU-parsed book
+    and a resumed run both work.
+    ► Fatal if a batch fails; completed batches survive for the re-run.
     │
     ▼
-Stage 4 — Reading Order
-    Sorts all content regions into the correct reading sequence.
-    Handles two-column layouts. Extracts equation numbers like "(3.14)".
-    │
-    ▼
-Stage 5A — Text OCR  (scanned PDFs only)
-    Runs PaddleOCR on text block regions to extract body text.
-    Skipped entirely for digital PDFs (text already extracted in Stage 2A).
-    │
-    ▼
-Stage 5B — Formula Recognition
-    Runs pix2tex on each equation crop image.
-    pix2tex outputs a LaTeX string for each equation.
-    For EPUB MathML: converts MathML to LaTeX directly (no AI needed).
-    ► Degraded per equation if pix2tex fails on one crop.
+Stage 5C — MathML conversion  (EPUB/HTML only)
+    Converts MathML to LaTeX directly. No model involved.
     │
     ▼
 Stage 6 — Validation and Repair
     For each equation:
-      1. Compiles the LaTeX with tectonic.
-      2. Compares the compiled output to the source crop (SSIM score).
-      3. If the score is below the threshold, applies heuristic repair rules
-         (fixes common pix2tex transcription errors like \Sum → \sum).
+      1. Compiles the LaTeX with tectonic, retaining the compiled XDV so
+         Stage 8A does not have to compile it a second time.
+      2. Scores whether the result is plausible (it compiles, and its shape
+         is consistent with the source region).
+      3. If it fails, applies heuristic repair rules and recompiles.
       4. Assigns a confidence gate: PASS, REPAIR, FALLBACK, or FLAGGED.
+    Runs in parallel, with a sequential retry pass for anything that timed
+    out under contention.
     │
     ▼
 Stage 7 — Routing
@@ -638,23 +743,29 @@ Stage 8A — SVG Rendering
     ▼
 Stage 8B — Fallback
     If Mathpix is configured: sends the equation image to Mathpix API.
-    Otherwise: marks the equation as flagged. A visible placeholder
-    [EQ:eq_3_12] appears in the EPUB so the reader knows something is missing.
+    Otherwise: embeds the equation's crop from the page raster as an image,
+    so a failed recognition degrades to a picture of the real equation
+    rather than to a placeholder.
     │
     ▼
 Stage 9 — SVG Post-Processing
-    Applies four Kindle-specific fixes to every SVG:
+    Applies five Kindle-specific fixes to every SVG:
     1. Removes font-size declarations (prevents KDP px→rem corruption).
     2. Converts dimensions from pt to em (scales with Kindle font size).
     3. Replaces fill="black" with fill="currentColor" (dark mode support).
     4. Strips XML declaration (invalid inside HTML5 inline SVG).
+    5. Namespaces glyph ids per equation (duplicate ids fail KDP review).
     │
     ▼
 Stage 10 — EPUB Assembly
-    Builds a valid EPUB3 ZIP file. SVGs are embedded inline in XHTML —
-    never as <object> tags (KindleGen rejects those). Runs epubcheck
-    validation if Java is available.
-    ► Fatal if assembly fails (a partial EPUB is not useful).
+    Assembles ONE global reading-order stream, not a chapter per page:
+    paragraphs split across a column or page break are rejoined, chapters
+    split at headings, URLs and DOIs become links, footnotes are placed at
+    section end. Chapters over 250 KB are split — Kindle silently fails to
+    render an XHTML file above ~300 KB.
+    SVGs are embedded inline in XHTML, never as <object> tags (KindleGen
+    rejects those). Runs epubcheck with a timeout scaled to the book size.
+    ► Fatal if assembly fails or epubcheck reports errors.
     │
     ▼
 Stage 11 — Output
@@ -703,36 +814,14 @@ which tectonic   # should print a path like /opt/homebrew/bin/tectonic
 
 ---
 
-**`paddlepaddle` or `paddleocr` fails to install**
-
-PaddlePaddle has strict Python version requirements. Check your version:
-```bash
-python3 --version   # needs to be 3.8–3.11
-```
-If you're on Python 3.12+, pin to Python 3.11 for this project using
-`pyenv` or `conda`.
-
----
-
 ### Model download failures
 
-**One or more models show as "Missing" after `download-models`**
+**The download stalls partway and never finishes**
 
-Check which package is missing and reinstall it:
+Most often a VPN. HuggingFace's Xet transfer protocol stalls on some networks;
+disable it:
 ```bash
-# pix2tex missing
-pip install pix2tex>=0.1.2
-
-# doclayout-yolo missing
-pip install doclayout-yolo>=0.0.2
-
-# ultralytics (needed for YOLOv8-MFD) missing
-pip install ultralytics
-```
-
-Then re-run:
-```bash
-python main.py download-models
+HF_HUB_DISABLE_XET=1 python main.py download-models
 ```
 
 ---
@@ -742,7 +831,6 @@ python main.py download-models
 HuggingFace is rate-limiting or temporarily unavailable. Wait a few minutes
 and retry. If the error persists, set a HuggingFace token:
 ```bash
-pip install huggingface_hub
 huggingface-cli login
 ```
 
@@ -757,21 +845,28 @@ File → Export as PDF (this creates an unencrypted copy).
 
 ---
 
-**`Stage 3 failed` — Formula detection failed**
+**`Stage 3 failed` — the MinerU parse failed on a batch**
 
-The formula detection model (YOLOv8-MFD) could not run. Most likely cause:
-`ultralytics` is not installed or the weights file is corrupted.
+The error names the batch and page range. Completed batches are kept, so
+re-running the same command resumes rather than starting over.
 
-```bash
-pip install ultralytics
-python main.py download-models
-```
+Common causes:
 
-If the weights file is corrupted, delete it and re-download:
-```bash
-rm ~/.kindle_converter/models/mfd_yolov8_mix.pt
-python main.py download-models
-```
+| Cause | Fix |
+|---|---|
+| Model not downloaded / partial download | `HF_HUB_DISABLE_XET=1 python main.py download-models` |
+| A batch timed out on very dense pages | Raise the per-page allowance: `--mineru-timeout 9000` |
+| Out of memory on a long book | Lower `--parse-batch-size` (try 25) |
+
+---
+
+**The run is re-parsing a book you already parsed on a GPU**
+
+The log shows `mineru_batch_start` where it should show `mineru_batch_reused`.
+`--parse-batch-size` almost certainly does not match the `--batch-pages` used
+for the remote parse — the batch directory names encode the ranges, so they have
+to agree. Check the names under `<output-dir>/mineru/` and pass the matching
+size. See [Running the parse on a GPU](#running-the-parse-on-a-gpu).
 
 ---
 
@@ -782,17 +877,20 @@ Run `brew install tectonic` again, then start a new terminal tab.
 
 ---
 
-**Many equations flagged — CDM scores are low**
+**Many equations flagged**
 
-The pix2tex recognition is producing LaTeX that doesn't match the source.
-Common causes and fixes:
+Recognition is producing LaTeX that does not compile or does not look plausible.
 
 | Cause | Fix |
 |---|---|
-| Source PDF is low resolution | Try rasterising at higher DPI (source quality issue, nothing to fix) |
+| Source PDF is low resolution | Nothing to fix — a source quality issue |
 | Equations use unusual symbol packages | Lower `--cdm-threshold` to 0.75–0.80 |
-| Handwritten equations | Not supported — this tool is for typeset documents only |
-| Very large or sparse equations | SSIM scoring degrades for these; lower the threshold |
+| Handwritten equations | Not supported — typeset documents only |
+
+Flagged equations are not lost: each falls back to its crop from the page image,
+so the reader still sees the real equation. Note the opposite failure is the one
+that matters more — an equation recognised *wrongly* but still compiling passes
+silently. See [Verifying a parser change](#verifying-a-parser-change).
 
 ---
 
@@ -856,17 +954,24 @@ Open `{title}_report.html` in any browser. Key things to look for:
 
 ## 9. Known limitations
 
-**Handwritten equations** — not supported. The recognition model (pix2tex)
-is trained on typeset academic documents.
+**Handwritten equations** — not supported. MinerU is trained on typeset
+academic documents.
+
+**No visual check on equations.** The quality gate asks whether the LaTeX
+compiles and looks plausible, never whether it matches the source image. An
+equation recognised wrongly but still compilable passes silently — measured
+against ground truth, both engines sit near 98.7%, so a 1000-equation book
+carries on the order of a dozen quiet errors. This is a known, accepted gap.
+`compare-snapshots` catches *changes* in recognition, not *errors* in it.
 
 **Very complex multi-line equation arrays** — `\begin{align}` blocks that
 span many lines sometimes get split across multiple detected regions or
-recognised incorrectly. Check the report for these and lower the threshold
-if needed.
+recognised incorrectly. Check the report for these.
 
-**Tables containing equations** — table detection is handled by DocLayout-YOLO
-but equation-in-table cases can be missed. If a table in your source document
-contains formulas, they may not be captured.
+**Tables containing equations** — tables are inlined as HTML when MinerU's
+output parses as valid `<table>` markup, and fall back to a page-image crop
+otherwise. Equations inside a table are not extracted as equations either way,
+so they do not scale with font size.
 
 **Right-to-left text** — not tested. Documents with Arabic or Hebrew body text
 alongside equations may have incorrect reading order.
