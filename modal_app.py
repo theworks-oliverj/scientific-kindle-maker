@@ -478,10 +478,26 @@ def main(
     if layout not in (LAYOUT_S03, LAYOUT_LABELLED):
         raise SystemExit(f"--layout must be {LAYOUT_S03} or {LAYOUT_LABELLED}")
 
-    paths = [Path(p.strip()) for p in pdf.split(",") if p.strip()]
-    for p in paths:
-        if not p.is_file():
-            raise SystemExit(f"not a file: {p}")
+    # A path that exists is never a list, whatever punctuation is in it.
+    # Academic PDFs are routinely named "Lastname, Firstname.pdf", and splitting
+    # those on the comma turns one real file into two paths that do not exist —
+    # so check the whole string before treating the comma as a separator.
+    raw = pdf.strip()
+    if Path(raw).is_file():
+        paths = [Path(raw)]
+    else:
+        paths = [Path(p.strip()) for p in raw.split(",") if p.strip()]
+    missing = [p for p in paths if not p.is_file()]
+    if missing:
+        # Name every miss, and say what the string was read as. A comma in a
+        # filename otherwise shows up as a puzzling "no such file" naming a
+        # path the user never typed.
+        detail = "\n".join(f"  not a file: {p}" for p in missing)
+        raise SystemExit(
+            f"--pdf did not resolve:\n{detail}\n"
+            f"(read as {len(paths)} path(s); --pdf splits on commas, so a comma "
+            f"in a filename must be a path that exists as given)"
+        )
 
     # The s03 layout keys directories on page range alone, so anything that
     # produces two jobs with the same range writes them to the same place and
