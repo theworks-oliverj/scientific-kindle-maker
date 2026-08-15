@@ -67,6 +67,16 @@ image = (
             "HF_HUB_DISABLE_XET": "1",  # Xet transfers stall on some networks
             "MINERU_MODEL_SOURCE": "huggingface",
             "PYTHONUNBUFFERED": "1",
+            # vLLM's own memory-accounting breakdown ("Memory profiling
+            # results: ... peak_torch_memory=... non_torch_memory=...") is
+            # logged at DEBUG, not INFO — confirmed against vllm's source
+            # (gpu_worker.py logs the memory snapshot via logger.debug).
+            # Without this, the ONE piece of evidence that names which
+            # internal term is responsible for a KV-cache failure never
+            # reaches our logs at all — which is exactly what happened
+            # investigating the derivation that failed 2026-08-14 (see
+            # modal-cost-model). Costs more log text, not more compute.
+            "VLLM_LOGGING_LEVEL": "DEBUG",
         }
     )
 )
@@ -285,10 +295,18 @@ def _telemetry() -> dict:
     # "no available memory for the cache blocks", the only question that matters
     # is how much of that 23 GB was already gone before we asked — and total
     # cannot answer it. Learned the hard way on the first real book.
+    #
+    # uuid is the one field that lets a later investigation answer "was this
+    # the SAME physical card as last time". Two runs on this project produced
+    # a 3x swing in fixed cost (7 vs 21 GiB) with identical inputs by every
+    # OTHER measure we had — model name and driver version cannot distinguish
+    # one L4 from another, and that gap is exactly the missing evidence for
+    # deciding host-heterogeneity vs something in our own request. See
+    # modal-cost-model.
     try:
         gpu = subprocess.run(
             ["nvidia-smi",
-             "--query-gpu=name,memory.total,memory.used,memory.free,driver_version",
+             "--query-gpu=name,memory.total,memory.used,memory.free,driver_version,uuid",
              "--format=csv,noheader"],
             capture_output=True, text=True, timeout=30,
         )
@@ -351,6 +369,18 @@ def _telemetry() -> dict:
                 break
     except Exception:
         pass
+
+    # Modal's own container identifiers, set automatically in every container
+    # (confirmed against Modal's docs — not something we configure). The point
+    # is not using these ourselves; it is having them ON HAND the moment a
+    # hardware anomaly needs escalating to Modal support. Discovering after
+    # the fact that a container's identity was never recorded means the report
+    # is "this GPU model sometimes misbehaves" instead of "this specific task
+    # ID, on this specific host, at this timestamp" — the difference between
+    # an anecdote and something they can actually investigate.
+    for var in ("MODAL_TASK_ID", "MODAL_CLOUD_PROVIDER", "MODAL_REGION",
+                "MODAL_IMAGE_ID"):
+        out[var.lower()] = os.environ.get(var)
     return out
 
 
@@ -510,6 +540,13 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
         used_util: "float | None" = None
         used_why = ""
         attempts_log: list[dict] = []
+        # Every rung's full output, not just the last one. A ladder job that
+        # fails rung 1 and succeeds on rung 2 used to discard rung 1's
+        # traceback entirely — exactly the evidence that would explain why the
+        # first rung failed. Reassigning `log` each iteration only feeds the
+        # per-attempt DIAGNOSIS check below; this list is what survives into
+        # the record.
+        full_log_parts: list[str] = []
 
         for rung, util in enumerate(candidates, 1):
             source = (f"explicit --gpu-mem-util {util}" if gpu_mem_util is not None
@@ -557,6 +594,10 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
                 "util": util, "skipped": False, "returncode": rc,
                 "elapsed_s": round(elapsed, 1),
             })
+            full_log_parts.append(
+                f"===== {label} rung {rung}/{len(candidates)} util={util} "
+                f"rc={rc} elapsed={elapsed:.0f}s =====\n{log}"
+            )
 
             if rc == 0:
                 break
@@ -603,7 +644,15 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
             "gpu_mem_util": used_util,
             "gpu_mem_util_why": used_why,
             "gpu_mem_attempts": attempts_log,
-            "log_tail": log[-3000:],
+            # Untruncated, every rung. The 3000-char cut this replaced is what
+            # turned a real traceback into 30-odd lines of a 200+ line error —
+            # discovered only when trying to file an evidence-based report
+            # after the fact and finding the evidence had been thrown away at
+            # the point of capture. This is plain text; there is no billing
+            # reason to bound it, only a legibility one, and the entrypoint
+            # writes it to its own file rather than cramming it into a
+            # terminal.
+            "log_full": "\n\n".join(full_log_parts),
             "tar": None,
         }
 
@@ -662,6 +711,7 @@ def main(
     import json
     import tarfile
     import time
+    import uuid
     from pathlib import Path
 
     if layout not in (LAYOUT_S03, LAYOUT_LABELLED):
@@ -796,25 +846,53 @@ def main(
         print(f"{rec['label']:40s} {rec['returncode']:>3} {rec['elapsed_s']:>7.0f}  {note}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = (work_dir if layout == LAYOUT_S03 else root) / "remote_run_summary.json"
+
+    # Timestamped, never overwritten. `remote_run_summary.json` used to live at
+    # one fixed path per output-root, so a retry against the same book — the
+    # ordinary case after a failure — silently replaced the failed attempt's
+    # summary with the new one. That is precisely how this project lost its
+    # own evidence of two real GPU-memory failures: the retry that eventually
+    # succeeded overwrote the record of the ones that didn't, on a platform
+    # whose own log retention (`modal app logs` returns at most the last 100
+    # entries; the web dashboard keeps 24h) cannot be relied on to have kept a
+    # second copy. Every attempt's summary AND every job's full, untruncated
+    # output now land under their own run directory instead.
+    # Second-resolution alone is not enough: caught by testing, not by
+    # inspection — two invocations within the same wall-clock second (a quick
+    # manual retry, or any future automated one) landed on the identical
+    # directory name and the second run clobbered the first, reproducing the
+    # exact bug this mechanism exists to close. A random suffix makes a
+    # collision require both the same second AND the same one-in-16M draw.
+    run_ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    run_dir = root / "_run_logs" / f"{run_ts}-{uuid.uuid4().hex[:6]}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    for rec in res["jobs"]:
+        (run_dir / f"{rec['label']}.log").write_text(rec.get("log_full") or "")
+
+    summary_path = run_dir / "remote_run_summary.json"
     summary = {
         "layout": layout,
         "batch_pages": batch_pages,
         "telemetry": res["telemetry"],
         "wall_s": round(wall, 1),
-        "jobs": [{k: v for k, v in r.items() if k != "tar"} for r in res["jobs"]],
+        # log_full already lives in its own per-job .log file next to this
+        # summary — keeping it here too would just duplicate potentially
+        # large text inside a JSON blob for no reader's benefit.
+        "jobs": [{k: v for k, v in r.items() if k not in ("tar", "log_full")}
+                 for r in res["jobs"]],
     }
     summary_path.write_text(json.dumps(summary, indent=2))
-    print(f"\nsummary + logs: {summary_path}")
+    print(f"\nsummary + logs: {run_dir}")
 
     if layout == LAYOUT_S03:
         _verify_s03_layout(written, work_dir, batch_pages, paths[0], output_root)
 
     failed = [r for r in res["jobs"] if r["returncode"] != 0]
     if failed:
-        print(f"\n{len(failed)} job(s) failed:")
+        print(f"\n{len(failed)} job(s) failed — full output in {run_dir}:")
         for r in failed:
-            print(f"--- {r['label']} ---\n{r['log_tail'][-1200:]}")
+            print(f"--- {r['label']} ---\n{(r.get('log_full') or '')[-1200:]}")
 
 
 def _verify_s03_layout(written, work_dir, batch_pages, pdf_path, output_root) -> None:
