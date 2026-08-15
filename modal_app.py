@@ -131,6 +131,29 @@ SCALEDOWN_WINDOW_S = 2
 # narrow that is a bad trade — and the spread it would address was never even
 # isolated (see the README's note on that flawed experiment).
 
+# Fraction of the GPU vLLM may use. MinerU leaves this at vLLM's conservative
+# default of **0.5** — half the card — which is what broke the first real book:
+#
+#   L4 total                23.0 GiB   (measured free at container start: 22.5)
+#   vLLM budget @ 0.5       ~11.5 GiB
+#     model weights          2.16 GiB
+#     CUDA graph pool        0.45 GiB  (58% above its own 0.19 estimate)
+#     encoder cache + activation peak, sized from the LARGEST page image
+#   -> KV cache left         0.51 GiB  on a 75-page book that SUCCEEDED
+#
+# Half a gigabyte of headroom on a 23 GB card is not a margin, it is luck. A
+# book with physically larger page images (Hartmann: 148 KB/page against
+# Frankel's 13) pushes the encoder cache up, the remainder goes negative, and
+# vLLM aborts with "No available memory for the cache blocks" before reading a
+# single page. Note this is driven by image size, NOT page count — batching
+# smaller does not help.
+#
+# 0.85 leaves the driver and the CUDA context room while roughly quadrupling
+# the budget. mineru's CLI is declared with ignore_unknown_options/
+# allow_extra_args and forwards ctx.args to the vLLM server, so this reaches
+# vLLM as a plain passthrough flag.
+GPU_MEM_UTIL = 0.85
+
 # How much of each mineru output line to echo. This was 150, chosen to keep a
 # tqdm bar readable, and it silently cost a diagnosis: vLLM reports its memory
 # budget as one long line —
@@ -295,7 +318,8 @@ def _telemetry() -> dict:
     scaledown_window=SCALEDOWN_WINDOW_S,
     volumes={"/root/.cache/huggingface": hf_cache, "/results": results},
 )
-def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict:
+def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
+               gpu_mem_util: float = GPU_MEM_UTIL) -> dict:
     """Runs every job in ONE container, sequentially.
 
     One container is the point: vLLM engine init costs 177–688 s and is paid per
@@ -334,6 +358,9 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict
         cmd = ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "vlm-engine"]
         if job.get("start") is not None and job.get("end") is not None:
             cmd += ["-s", str(job["start"]), "-e", str(job["end"])]
+        # Unknown to mineru, forwarded verbatim to the vLLM server it starts.
+        # Must come last: everything after this point is passthrough.
+        cmd += ["--gpu-memory-utilization", str(gpu_mem_util)]
 
         print(f"\n[kmc] === {label} ({i}/{len(jobs)}) ===", flush=True)
         print(f"[kmc] {' '.join(cmd)}", flush=True)
@@ -473,6 +500,7 @@ def main(
     batch_pages: int = 0,
     pages: str = "",
     layout: str = LAYOUT_S03,
+    gpu_mem_util: float = GPU_MEM_UTIL,
 ):
     """`--pdf` takes one path or several comma-separated.
 
@@ -594,7 +622,7 @@ def main(
         print(f"   {j['label']:38s} {rng}")
 
     t0 = time.perf_counter()
-    res = parse_jobs.remote(jobs)
+    res = parse_jobs.remote(jobs, gpu_mem_util=gpu_mem_util)
     wall = time.perf_counter() - t0
 
     print(f"\nhardware: {json.dumps(res['telemetry'], indent=None)}")
