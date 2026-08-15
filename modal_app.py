@@ -131,6 +131,20 @@ SCALEDOWN_WINDOW_S = 2
 # narrow that is a bad trade — and the spread it would address was never even
 # isolated (see the README's note on that flawed experiment).
 
+# How much of each mineru output line to echo. This was 150, chosen to keep a
+# tqdm bar readable, and it silently cost a diagnosis: vLLM reports its memory
+# budget as one long line —
+#
+#   Memory profiling results: ... total_gpu_memory=22.49GiB
+#   initial_memory_usage=... peak_torch_memory=... non_torch_memory=...
+#   gpu_memory_utilization=0.90
+#
+# — and every number in it sits past column 150. When the first real book died
+# on "No available memory for the cache blocks", the one line that would have
+# explained why had been cut off before it reached the log. Wide enough for that
+# line now; still bounded, because vLLM also prints multi-KB config dumps.
+LOG_LINE_CHARS = 600
+
 # tqdm writes "<done>/<total>" — e.g. "Predict:  48%|####  | 94/197 [01:13<...]".
 # That counter is the only trustworthy evidence that work is actually moving;
 # the surrounding text redraws whether or not it is.
@@ -198,9 +212,15 @@ def _telemetry() -> dict:
 
     out: dict[str, object] = {}
 
+    # memory.used and memory.free, not just total. `total` says the card is a
+    # 23 GB L4 and nothing more; when vLLM refuses to start because there is
+    # "no available memory for the cache blocks", the only question that matters
+    # is how much of that 23 GB was already gone before we asked — and total
+    # cannot answer it. Learned the hard way on the first real book.
     try:
         gpu = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+            ["nvidia-smi",
+             "--query-gpu=name,memory.total,memory.used,memory.free,driver_version",
              "--format=csv,noheader"],
             capture_output=True, text=True, timeout=30,
         )
@@ -399,7 +419,7 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict
                 if state != progress[0]:
                     progress[0] = state
                     last_advance[0] = now()
-            print(f"[mineru:{label}] {line.rstrip()[:150]}", flush=True)
+            print(f"[mineru:{label}] {line.rstrip()[:LOG_LINE_CHARS]}", flush=True)
         rc = proc.wait()
         watch.join(timeout=10)
         elapsed = time.perf_counter() - t0
