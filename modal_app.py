@@ -24,17 +24,28 @@ WHAT IS ALREADY KNOWN (measured, see the parser-experiments note)
 HOW IT PLUGS IN
     It does not touch the pipeline. s03 reuses any middle.json found under
     `<output-dir>/mineru/`, so results are unpacked into exactly that layout and
-    a normal local run picks them up and skips MinerU.
+    a normal local run picks them up and skips MinerU. `--output-root` here IS
+    the pipeline's `--output-dir`; point both at the same directory and there is
+    nothing to move by hand. See the layout note further down.
 
 ROLLBACK
     Nothing imports this; it imports nothing from kindle_math_converter.
     Delete the file (and `pip uninstall modal`) and the project is unchanged.
 
 USAGE
-    modal run modal_app.py --pdf "/path/a.pdf"
-    modal run modal_app.py --pdf "/path/a.pdf,/path/b.pdf" --output-root ./output/REMOTE
-    modal run modal_app.py --pdf "/path/a.pdf" --repeat 2      # determinism check
-    modal run modal_app.py --pdf "/path/a.pdf" --batch-pages 5 # resumable batches
+    # One book, ready for the pipeline to pick up (the normal case).
+    modal run modal_app.py --pdf "/path/book.pdf" \
+        --output-root ~/Desktop/KindleReads/Book --batch-pages 250
+    python main.py convert "/path/book.pdf" \
+        --output-dir ~/Desktop/KindleReads/Book --parse-batch-size 250
+
+    # --parse-batch-size must equal --batch-pages: it is what the batch
+    # directory names encode. The run verifies this before it prints the
+    # command, and re-running fills in any batch that failed.
+
+    # Parser QA — needs the labelled layout, results moved into place by hand.
+    modal run modal_app.py --pdf "/path/a.pdf" --repeat 2 --layout labelled
+    modal run modal_app.py --pdf "/path/a.pdf" --pages 0-5 --layout labelled
 """
 import re
 
@@ -124,6 +135,52 @@ SCALEDOWN_WINDOW_S = 2
 # That counter is the only trustworthy evidence that work is actually moving;
 # the surrounding text redraws whether or not it is.
 _PROGRESS_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+# ---------------------------------------------------------------------------
+# Output layout
+#
+# s03 reuses a parse it finds on disk instead of running MinerU, which is the
+# whole reason remote parsing is useful. But it only finds one laid out its way:
+#
+#     whole document   <out>/mineru/<stem>/vlm/<stem>_middle.json
+#     one batch        <out>/mineru/batch_{start:05d}_{end:05d}/<stem>/vlm/…
+#
+# where <out> is the pipeline's --output-dir. Writing anything else means
+# renaming directories by hand between the download and the local run, and a
+# slip there does not fail loudly — it attaches one batch's equations to
+# another batch's pages, because s03 re-bases page_idx by the offset the
+# directory name encodes. So this module writes that layout directly.
+#
+# DUPLICATED ON PURPOSE. modal_app.py imports nothing from
+# kindle_math_converter so that deleting this file is a complete rollback, and
+# that isolation is worth more than sharing two small pieces of logic. What is
+# duplicated, and what must stay in sync with
+# kindle_math_converter/stages/s03_mineru_parse.py:
+#
+#   1. the directory name format `batch_{start:05d}_{end:05d}`
+#   2. the range algebra in `_page_batches`, INCLUDING its short-circuit when
+#      total_pages <= batch_size (one range covering the document, not a
+#      truncated first batch)
+#
+# Item 2 is the easy one to miss: the two implementations agree today for every
+# case, and a plausible-looking edit to either could silently break that.
+LAYOUT_S03 = "s03"
+LAYOUT_LABELLED = "labelled"
+
+
+def _page_batches(total_pages: int, batch_size: int) -> list[tuple[int, int]]:
+    """Mirror of s03's `_page_batches`. See the note above before editing."""
+    if batch_size <= 0 or total_pages <= batch_size:
+        return [(0, max(0, total_pages - 1))]
+    return [
+        (start, min(start + batch_size - 1, total_pages - 1))
+        for start in range(0, total_pages, batch_size)
+    ]
+
+
+def _batch_dir_name(start: int, end: int) -> str:
+    """Mirror of s03's batch directory name. See the note above before editing."""
+    return f"batch_{start:05d}_{end:05d}"
 
 
 def _telemetry() -> dict:
@@ -395,12 +452,22 @@ def main(
     repeat: int = 1,
     batch_pages: int = 0,
     pages: str = "",
+    layout: str = LAYOUT_S03,
 ):
     """`--pdf` takes one path or several comma-separated.
 
     `--repeat N` parses each document N times (determinism check).
     `--batch-pages N` splits each document into N-page ranges (exercises the
     resumable path that protects a long book).
+    `--layout` picks the on-disk shape of the result:
+
+      s03 (default)  ready for the pipeline to reuse — `--output-root` IS the
+                     book's `--output-dir`, and a local run picks the parse up
+                     with no hand-moving. One book per invocation.
+      labelled       one directory per job, named after the job. Needed for
+                     `--repeat` and `--pages`, which have no place in the s03
+                     layout because their outputs collide or are never looked
+                     for. Results must be moved into place by hand.
     """
     import io
     import json
@@ -408,10 +475,42 @@ def main(
     import time
     from pathlib import Path
 
+    if layout not in (LAYOUT_S03, LAYOUT_LABELLED):
+        raise SystemExit(f"--layout must be {LAYOUT_S03} or {LAYOUT_LABELLED}")
+
     paths = [Path(p.strip()) for p in pdf.split(",") if p.strip()]
     for p in paths:
         if not p.is_file():
             raise SystemExit(f"not a file: {p}")
+
+    # The s03 layout keys directories on page range alone, so anything that
+    # produces two jobs with the same range writes them to the same place and
+    # the second silently overwrites the first. The label layout exists for
+    # exactly these cases; refuse rather than quietly lose a parse.
+    #
+    # --repeat is the dangerous one. Its only purpose is feeding
+    # `compare-snapshots` a second parse of the same book to check that the GPU
+    # gave consistent answers. Overwritten, that check compares a file with
+    # itself and reports "identical" — a test built to catch parser
+    # non-determinism would pass every time while verifying nothing.
+    if layout == LAYOUT_S03:
+        why = None
+        if len(paths) > 1:
+            why = (f"{len(paths)} PDFs share one --output-root; s03 layout holds "
+                   f"one book (its work_dir is <output-dir>/mineru)")
+        elif repeat > 1:
+            why = ("--repeat writes every repetition to the same page-range "
+                   "directory, so only the last survives and a determinism "
+                   "check would compare a file with itself")
+        elif pages:
+            why = ("--pages writes an ad-hoc range s03 never looks for; it "
+                   "derives batch names from the whole document")
+        if why:
+            raise SystemExit(
+                f"refusing to run: {why}.\n"
+                f"Use --layout {LAYOUT_LABELLED} for this, or run one book per "
+                f"invocation with its own --output-root."
+            )
 
     def page_count(path: Path) -> int:
         try:
@@ -430,8 +529,10 @@ def main(
         elif batch_pages > 0:
             n = page_count(path)
             if n:
-                ranges = [(s, min(s + batch_pages - 1, n - 1))
-                          for s in range(0, n, batch_pages)]
+                # Built from the shared mirror of s03's own batching, so the
+                # directory names agree by construction rather than by
+                # coincidence.
+                ranges = list(_page_batches(n, batch_pages))
         for rep in range(1, repeat + 1):
             for bi, (s, e) in enumerate(ranges, 1):
                 # Index-prefixed so the same PDF can be listed twice (the
@@ -465,8 +566,18 @@ def main(
     print(f"{'job':40s} {'rc':>3s} {'secs':>7s}  output")
 
     root = Path(output_root)
+    work_dir = root / "mineru"
+    written: list[Path] = []
     for rec in res["jobs"]:
-        dest = root / rec["label"] / "mineru"
+        if layout == LAYOUT_LABELLED:
+            dest = root / rec["label"] / "mineru"
+        elif rec["start"] is None:
+            # Whole-document parse. The tar already carries <stem>/vlm/…, which
+            # is what s03 globs for directly under work_dir.
+            dest = work_dir
+        else:
+            dest = work_dir / _batch_dir_name(rec["start"], rec["end"])
+
         note = "-"
         if rec["tar"]:
             dest.mkdir(parents=True, exist_ok=True)
@@ -474,21 +585,97 @@ def main(
                 tar.extractall(dest, filter="data")
             found = sorted(dest.rglob("*_middle.json"))
             note = f"{len(found)} middle.json -> {dest}"
+            written.append(dest)
         else:
             note = "FAILED (see log below)"
         print(f"{rec['label']:40s} {rec['returncode']:>3} {rec['elapsed_s']:>7.0f}  {note}")
 
-    (root).mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = (work_dir if layout == LAYOUT_S03 else root) / "remote_run_summary.json"
     summary = {
+        "layout": layout,
+        "batch_pages": batch_pages,
         "telemetry": res["telemetry"],
         "wall_s": round(wall, 1),
         "jobs": [{k: v for k, v in r.items() if k != "tar"} for r in res["jobs"]],
     }
-    (root / "remote_run_summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"\nsummary + logs: {root / 'remote_run_summary.json'}")
+    summary_path.write_text(json.dumps(summary, indent=2))
+    print(f"\nsummary + logs: {summary_path}")
+
+    if layout == LAYOUT_S03:
+        _verify_s03_layout(written, work_dir, batch_pages, paths[0], output_root)
 
     failed = [r for r in res["jobs"] if r["returncode"] != 0]
     if failed:
         print(f"\n{len(failed)} job(s) failed:")
         for r in failed:
             print(f"--- {r['label']} ---\n{r['log_tail'][-1200:]}")
+
+
+def _verify_s03_layout(written, work_dir, batch_pages, pdf_path, output_root) -> None:
+    """Checks the directories we just wrote are ones s03 will actually find.
+
+    The failure this exists for is silent and expensive. If the local run is
+    given a different --parse-batch-size than the remote run used, s03 looks
+    for batch directories that do not exist, finds nothing to reuse, and parses
+    the book again locally at ~45 s/page — six hours on a 480-page book, with
+    no error, presenting only as slowness. Printing the right command helps
+    only if it is copied correctly every time, so check it here instead: this
+    process already knows the page count and the batch size.
+    """
+    from pathlib import Path
+
+    ok = True
+    missing: list[str] = []
+    expected: set[str] = set()
+
+    # s03 finds a parse with glob("*/*/*_middle.json") relative to the batch
+    # directory (or work_dir, whole-document). Anything shallower or deeper is
+    # invisible to it, so verify at that exact depth rather than recursively —
+    # a recursive search would pass on a layout s03 cannot read.
+    for dest in written:
+        if not list(Path(dest).glob("*/*/*_middle.json")):
+            print(f"\n  PROBLEM: {dest} has no <stem>/vlm/*_middle.json — "
+                  f"s03 will not see this parse.")
+            ok = False
+
+    try:
+        import pymupdf
+        n = pymupdf.open(str(pdf_path)).page_count
+    except Exception:
+        n = 0
+
+    if n and batch_pages > 0:
+        expected = {_batch_dir_name(s, e) for s, e in _page_batches(n, batch_pages)}
+        actual = {p.name for p in work_dir.iterdir()
+                  if p.is_dir() and p.name.startswith("batch_")}
+        # Unexpected names mean the two batching implementations have drifted;
+        # that is a bug and every page offset downstream is suspect.
+        for name in sorted(actual - expected):
+            print(f"\n  PROBLEM: {name} is not a batch s03 would ask for at "
+                  f"--parse-batch-size {batch_pages}. The batching in this file "
+                  f"and in s03_mineru_parse.py have diverged.")
+            ok = False
+        # Missing ones are not an error — that is resumability working. s03
+        # parses just those locally, which is slow but correct, so say so
+        # plainly rather than implying the run is broken.
+        missing = sorted(expected - actual)
+
+    if ok and not missing:
+        print(f"\n  layout verified — s03 will reuse this parse.")
+    elif ok:
+        # Deliberately not "verified": what was written is findable, but the
+        # book is only partly parsed, and saying otherwise invites a local run
+        # that quietly spends hours on the gap.
+        print(f"\n  layout OK, but {len(missing)} of {len(expected)} batches are "
+              f"missing ({', '.join(missing[:3])}{'…' if len(missing) > 3 else ''}).")
+        print(f"  The local run will parse those pages itself (~45 s/page). "
+              f"Re-run this command first to fill them in remotely instead.")
+
+    flag = f" --parse-batch-size {batch_pages}" if batch_pages > 0 else ""
+    print(f"\nnext, locally:\n"
+          f"  python main.py convert \"{pdf_path}\" "
+          f"--output-dir \"{output_root}\"{flag}")
+    if batch_pages > 0:
+        print(f"\n  --parse-batch-size MUST be {batch_pages} — it is what the batch "
+              f"directory names above encode.")

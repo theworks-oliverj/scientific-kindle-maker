@@ -1,60 +1,75 @@
-# PDF extraction
-pymupdf>=1.24.0
-pdfplumber>=0.11.0
+# The document parser. This is the pipeline's front half — it replaced the old
+# YOLO + PaddleOCR + pix2tex stack entirely, so none of those appear here.
+#
+# THE PLATFORM EXTRA IS NOT OPTIONAL — it IS the GPU backend. Without it
+# MinerU silently falls back to `transformers` on CPU, which is not a slower
+# version of the same thing: it is slow enough (tens of hours for a textbook)
+# to be unusable. See the README, "System requirements".
+#
+#   `vlm`   the VLM backend itself (torch, transformers, accelerate)
+#   `mlx`   Apple Silicon GPU, via Metal
+#   `vllm`  NVIDIA CUDA GPU
+#
+# Deliberately NOT `core`, which is `vlm` + `pipeline` + `gradio`: `gradio` is a
+# web UI this project never launches, and `pipeline` is MinerU's non-VLM backend
+# (OmniDocBench 86.47 vs the VLM path's 95.30) which this project rejects on
+# accuracy. Together they are ~25 unused packages including a second copy of the
+# torchvision/onnxruntime stack.
+#
+# Pinned: MinerU's version determines the recognition output, and an unpinned
+# upgrade changes equations in a way nothing downstream will flag.
+#
+# LINUX USERS: pip cannot resolve the `vllm` branch of this tree — it backtracks
+# through cffi sdists indefinitely (observed >10 min with no end). Use uv, which
+# resolves it in about five seconds:
+#
+#   uv pip install -r kindle_math_converter/requirements.txt
+#
+# A known-good fully-pinned Linux x86_64 set already exists in the repo root as
+# modal-requirements.txt (`uv pip compile` of `mineru[core,vlm,vllm]==3.4.4`).
+# It is what the Modal GPU image is built from, so it is the most-tested Linux
+# dependency set here — prefer it if you are standing up a Linux box.
+#
+# macOS needs none of this: the mlx branch resolves under plain pip in seconds.
+mineru[vlm,mlx]==3.4.4 ; sys_platform == "darwin"
+mineru[vlm,vllm]==3.4.4 ; sys_platform == "linux"
 
-# Image processing
+# PDF reading and rasterization
+PyMuPDF>=1.24.0
+pdf2image>=1.17.0          # needs the poppler binaries (brew install poppler)
+
+# Image processing — equation crops, figure crops
 Pillow>=10.0.0
-pdf2image>=1.17.0
-opencv-python>=4.9.0
-
-# Layout and formula detection
-doclayout-yolo>=0.0.2
-ultralytics>=8.0.0
-
-# Math expression recognition: equation image → LaTeX
-# pix2tex replaces unimernet — cleaner dependency tree (no eva-decord conflict).
-# CPU-only torch install (run before pip install -r requirements.txt):
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-pix2tex>=0.1.2
-
-# OCR
-paddleocr>=2.7.3
-paddlepaddle>=2.6.0
+opencv-contrib-python>=4.9.0
+numpy>=1.26.0
 
 # LaTeX rendering
-# tectonic is invoked as a subprocess — install the binary separately:
-# macOS: brew install tectonic
-# Linux: cargo install tectonic  OR  https://tectonic-typesetting.github.io/en-US/install.html
-# dvisvgm is similarly a binary: brew install dvisvgm  /  apt install dvisvgm
+# tectonic and dvisvgm are BINARIES invoked as subprocesses, not pip packages:
+#   macOS: brew install tectonic dvisvgm
+#   Linux: see https://tectonic-typesetting.github.io/en-US/install.html
+#          apt install dvisvgm
 
-# SVG processing
+# SVG processing and EPUB assembly
 lxml>=5.2.0
-svgpathtools>=1.6.1
-
-# EPUB assembly
-ebooklib>=0.18
+EbookLib>=0.18
 
 # Validation
-# epubcheck is a Java jar invoked as a subprocess — must be installed separately.
-# See: https://github.com/w3c/epubcheck
+# epubcheck is a Java jar invoked as a subprocess — install separately:
+#   macOS: brew install epubcheck   (bundles its own JDK)
+#   See: https://github.com/w3c/epubcheck
 
-# Reporting
+# Reporting and CLI
 jinja2>=3.1.0
 rich>=13.0.0
-
-# Model weight management (auto-download from HuggingFace Hub)
-huggingface_hub>=0.23.0
-
-# Utilities
-pydantic>=2.0.0
-structlog>=24.0.0
 click>=8.1.0
+structlog>=24.0.0
 
-# QA — simplified CDM (SSIM)
+# Quality scoring
 scikit-image>=0.22.0
 
-# Optional: visual diff in report (cairosvg for SVG rasterization)
-# cairosvg>=2.7.0
+# Optional: Mathpix fallback recogniser (Stage 8B)
+requests>=2.31.0
 
-# Optional: Mathpix fallback (Stage 8B)
-# requests>=2.31.0
+# Optional: rasterised SVG previews in the HTML report. Imported behind a
+# try/except — the report renders without it.
+# cairosvg>=2.7.0
