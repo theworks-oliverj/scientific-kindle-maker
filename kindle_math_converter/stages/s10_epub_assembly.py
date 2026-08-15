@@ -330,10 +330,32 @@ def _svgs_referencing_outside_themselves(xhtml: str) -> list[str]:
     return orphans
 
 
+# Elements XHTML defines that can legitimately appear inside a table. Anything
+# outside this set is unwrapped rather than trusted — see _valid_table_html.
+_TABLE_ALLOWED_TAGS = frozenset({
+    "table", "thead", "tbody", "tfoot", "tr", "td", "th",
+    "caption", "colgroup", "col",
+    "a", "b", "br", "code", "em", "i", "p", "span", "strong", "sub", "sup",
+})
+
+
 def _valid_table_html(table_html: str) -> Optional[str]:
-    """Returns MinerU's table HTML if it is well-formed XML with a <table>
-    root (safe to inline in XHTML); None otherwise (caller falls back to
-    the raster crop)."""
+    """Returns MinerU's table HTML made safe to inline in XHTML, or None.
+
+    Well-formed XML is NOT the same test as valid XHTML, and the difference is
+    fatal. MinerU wraps inline equations inside table cells in a non-standard
+    <eq> element:
+
+        <td>Exterior p-Forms and Algebra in <eq>\\mathbb{R}^{n}</eq></td>
+
+    That parses as XML, so an earlier version of this function passed it
+    straight through, and epubcheck then rejected the entire book — for one
+    such tag in one table of contents, out of a 1400-equation document.
+
+    Unknown elements are unwrapped, keeping their text, rather than sent to the
+    raster fallback: a table of contents that renders as searchable text with a
+    bare LaTeX fragment in it is worth more than a picture of one.
+    """
     try:
         from lxml import etree  # type: ignore
         root = etree.fromstring(table_html.encode())
@@ -341,7 +363,16 @@ def _valid_table_html(table_html: str) -> Optional[str]:
         return None
     if root.tag != "table":
         return None
-    return table_html
+
+    unknown = {
+        el.tag for el in root.iter()
+        if isinstance(el.tag, str) and el.tag not in _TABLE_ALLOWED_TAGS
+    }
+    if unknown:
+        # strip_tags drops the elements but keeps their text, children and
+        # tails, so cell contents survive intact.
+        etree.strip_tags(root, *unknown)
+    return etree.tostring(root, encoding="unicode")
 
 
 def _document_to_chapters(
