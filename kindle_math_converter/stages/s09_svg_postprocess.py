@@ -104,6 +104,42 @@ def clean_for_inline_embedding(svg: str) -> str:
     return svg.strip()
 
 
+# Quote- and prefix-agnostic on purpose: dvisvgm's raw output uses single
+# quotes and xlink:href (e.g. <use xlink:href='#g1-82'/>), while by the time
+# an SVG reaches namespace_svg_ids it has been through set_em_dimensions'
+# lxml round-trip (which normalises to double quotes) and
+# clean_for_inline_embedding (xlink:href -> href). Matching both forms lets
+# find_orphaned_use_refs be called at either point without silently finding
+# nothing because it was checking for a form that has not appeared yet.
+_ID_RE = re.compile(r'''\bid=["']([^"']+)["']''')
+_HREF_RE = re.compile(r'''(?:xlink:)?href=["']#([^"']+)["']''')
+
+
+def find_orphaned_use_refs(svg: str) -> set[str]:
+    """Ids that a href="#..." names but that no id="..." in `svg` declares.
+
+    dvisvgm's contract is that every glyph a <use> draws is defined in that
+    same render's own <defs> — but it does not always hold it. Found on a
+    271-page book: a handful of equations came back from dvisvgm with a
+    `<use xlink:href='#g1-82'/>` and no matching `<path id='g1-82'>`
+    anywhere in that equation's own SVG — the glyph was simply never
+    emitted. A DIFFERENT, unrelated equation happened to define its own
+    glyph under the same locally-numbered id ("gN-MM" is font-index +
+    glyph-index local to one dvisvgm invocation, not a real cross-reference),
+    which is how this reads as a real id if you only check "does this string
+    appear somewhere in the document" rather than "is it defined in THIS
+    equation's own render."
+
+    `namespace_svg_ids` cannot catch this: it only rewrites ids it can find
+    declared, so an orphaned reference passes through it untouched and
+    reaches the assembled book still broken. Call this on dvisvgm's raw
+    output, before it is accepted, so the equation can fall back instead.
+    """
+    defined = set(_ID_RE.findall(svg))
+    used = set(_HREF_RE.findall(svg))
+    return used - defined
+
+
 def namespace_svg_ids(svg: str, prefix: str) -> str:
     """
     Makes every glyph id in this SVG unique to one equation by prefixing it.
