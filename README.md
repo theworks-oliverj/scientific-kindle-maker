@@ -466,6 +466,69 @@ yourself.
 Failed batches are not fatal. Each one commits to a Modal Volume as it finishes,
 so re-running the same command fills in only what is missing.
 
+### How much GPU memory the engine gets
+
+MinerU runs vLLM at `gpu_memory_utilization=0.5` — half the card, whatever the
+card is. On a 23 GiB L4 that budgets ~11.25 GiB, and the engine spends almost
+all of it before caching anything:
+
+| | GiB |
+|---|---|
+| Budget at 0.5 | 11.25 |
+| − model weights | 2.16 |
+| − activation / profiling peak | 8.13 |
+| − CUDA graph pool | 0.45 |
+| **= KV cache** | **0.51** |
+
+A 75-page book completed on that 0.51 GiB. A 481-page book did not — it aborted
+at startup with `No available memory for the cache blocks`, having read nothing.
+That is a 2% margin on an idle card, and the log shows the CUDA graph pool
+overshooting its own estimate by 58% (0.45 actual against 0.19 predicted), a
+swing worth half of what was left.
+
+**The 8.13 GiB does not depend on the document.** vLLM sizes it from
+`max_model_len` and the config's maximum feature size, profiling the worst case
+the configuration allows rather than the pages in front of it. Two consequences
+that are easy to get backwards:
+
+- Parsing **fewer pages per batch does not help.** The peak is per-engine, not
+  per-batch.
+- A **denser or higher-resolution book does not make it worse.** The two books
+  above were not on opposite sides of a threshold; they were on opposite sides
+  of ordinary run-to-run variance.
+
+What *does* vary is how much of the card is free — a different GPU, another
+process, or a previous batch that did not release cleanly. So the fraction is
+**derived at run time from measured free memory**: take what is free, hold back
+2 GiB for the CUDA context and allocator slack, and express the rest as the
+fraction of total that vLLM expects. On an idle L4 that lands near `0.891` and
+turns 0.51 GiB of KV cache into roughly 9.3 GiB.
+
+If the projection leaves under 1 GiB, the run says so with the numbers instead
+of letting vLLM fail 190 s later with a message that names a knob rather than
+the cause. The check is on the absolute remainder, not the fraction — 0.55 of an
+A100 is 44 GiB and ample, 0.70 of an 8 GiB card is 5.5 GiB and cannot hold the
+engine at all.
+
+Override with `--gpu-mem-util 0.85` to pin it.
+
+**Downstream effects, since this is not only a reliability setting:**
+
+- **Throughput and cost.** A larger KV cache lets vLLM run more sequences
+  concurrently, so the expected effect is faster and therefore cheaper. This is
+  unmeasured. The baseline to measure against is 2.6 s/page, from a 75-page book
+  at the old `0.5`.
+- **Recognition output.** This is the one to know about. GPU parses are already
+  non-reproducible because batch composition changes the order of floating-point
+  reductions; KV cache size changes how requests get batched, so **changing this
+  value changes which equations come back**. It does not make recognition worse,
+  but a snapshot taken before the change is not a fair baseline for one taken
+  after. The derived value and its derivation are recorded in
+  `mineru/remote_run_summary.json` for exactly this reason — see
+  [Verifying a parser change](#verifying-a-parser-change).
+- **Failure cost.** A doomed engine start costs ~190 s of billed GPU either way.
+  The projection is what turns that into a message worth reading.
+
 ### Working out what a GPU run costs
 
 > **Rates below were captured on 2026-08-12 and verified against one real

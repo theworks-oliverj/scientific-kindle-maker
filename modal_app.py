@@ -131,28 +131,57 @@ SCALEDOWN_WINDOW_S = 2
 # narrow that is a bad trade — and the spread it would address was never even
 # isolated (see the README's note on that flawed experiment).
 
-# Fraction of the GPU vLLM may use. MinerU leaves this at vLLM's conservative
-# default of **0.5** — half the card — which is what broke the first real book:
+# How much of the GPU vLLM may use.
 #
-#   L4 total                23.0 GiB   (measured free at container start: 22.5)
-#   vLLM budget @ 0.5       ~11.5 GiB
-#     model weights          2.16 GiB
-#     CUDA graph pool        0.45 GiB  (58% above its own 0.19 estimate)
-#     encoder cache + activation peak, sized from the LARGEST page image
-#   -> KV cache left         0.51 GiB  on a 75-page book that SUCCEEDED
+# MinerU leaves this at 0.5 — half the card, whatever the card is — and on the
+# first real book that was not enough. Measured on an L4 with the GPU otherwise
+# idle (22.5 GiB of 22.49 GiB free):
 #
-# Half a gigabyte of headroom on a 23 GB card is not a margin, it is luck. A
-# book with physically larger page images (Hartmann: 148 KB/page against
-# Frankel's 13) pushes the encoder cache up, the remainder goes negative, and
-# vLLM aborts with "No available memory for the cache blocks" before reading a
-# single page. Note this is driven by image size, NOT page count — batching
-# smaller does not help.
+#   budget @ 0.5            11.25 GiB
+#     model weights          2.16
+#     activation/profiling   8.13   <- vLLM profiles the WORST CASE the config
+#     CUDA graph pool        0.45      allows: an encoder cache of max_model_len
+#   -> KV cache left         0.51      (8192) tokens at the maximum feature size
 #
-# 0.85 leaves the driver and the CUDA context room while roughly quadrupling
-# the budget. mineru's CLI is declared with ignore_unknown_options/
-# allow_extra_args and forwards ctx.args to the vLLM server, so this reaches
-# vLLM as a plain passthrough flag.
-GPU_MEM_UTIL = 0.85
+# 0.51 GiB spare out of 22.5 is a 2% margin, and it is not stable: the log shows
+# the CUDA graph pool overrunning its own estimate by 58% (0.45 actual against
+# 0.19 predicted), a swing worth half of what remained. A book that failed and a
+# book that succeeded were not on opposite sides of a threshold; they were on
+# opposite sides of a coin flip.
+#
+# WHAT DOES NOT VARY: the 8.13 GiB. vLLM sizes it from max_model_len and the
+# config's maximum feature size, NOT from the pages of the document in front of
+# it. So this cannot be tuned per book, and batching smaller does not help —
+# both were plausible and both are wrong.
+#
+# WHAT DOES VARY: how much of the card is free. A different GPU, a second
+# process, or our own previous batch leaking on the way out all move it. So the
+# fraction is DERIVED at run time from measured free memory rather than fixed:
+# take what is actually free, hold back a reserve, express it as the fraction of
+# total that vLLM wants. On an idle L4 that lands near 0.91 and turns the 0.51
+# GiB of KV cache into roughly 9.5 GiB.
+#
+# Set --gpu-mem-util explicitly to override the derivation.
+GPU_MEM_UTIL: "float | None" = None
+
+# Held back from vLLM: the CUDA context, allocator fragmentation, and the gap
+# between vLLM's CUDA-graph estimate and what it actually takes (0.26 GiB on the
+# one run we have measured). Two GiB is comfortably more than the observed
+# overrun, and costs nothing but KV cache we were not going to need.
+GPU_MEM_RESERVE_GIB = 2.0
+
+# Never hand over the whole card however much is free.
+GPU_MEM_UTIL_MAX = 0.95
+
+# What the engine consumes before any KV cache exists, measured on the L4:
+# 2.16 weights + 8.13 activation/profiling peak + 0.45 CUDA graphs. Model and
+# config are pinned, so this is a constant of the setup rather than of the run.
+GPU_ENGINE_FIXED_GIB = 10.75
+# A KV cache smaller than this runs, but with so little room for concurrent
+# sequences that throughput collapses — and it is one bad estimate away from
+# not starting at all. Frankel completed on 0.51 GiB, so this is not a hard
+# limit; it is the line below which we say so out loud.
+GPU_MIN_KV_GIB = 1.0
 
 # How much of each mineru output line to echo. This was 150, chosen to keep a
 # tqdm bar readable, and it silently cost a diagnosis: vLLM reports its memory
@@ -218,6 +247,64 @@ def _page_batches(total_pages: int, batch_size: int) -> list[tuple[int, int]]:
 def _batch_dir_name(start: int, end: int) -> str:
     """Mirror of s03's batch directory name. See the note above before editing."""
     return f"batch_{start:05d}_{end:05d}"
+
+
+def _gpu_memory_gib() -> "tuple[float, float] | None":
+    """(total, free) GiB from the driver, or None if it cannot be read."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip().splitlines()[0]
+        total_mib, free_mib = (float(x.strip()) for x in out.split(","))
+        return total_mib / 1024, free_mib / 1024
+    except Exception:
+        return None
+
+
+def _derive_gpu_mem_util(explicit: "float | None") -> tuple[float, str]:
+    """Fraction of the card to give vLLM, from what is actually free right now.
+
+    Returns (fraction, explanation). The explanation is logged because this
+    number decides whether the engine starts at all, and a bare float in a log
+    is not enough to debug a failure six hours later.
+
+    Deriving beats a constant in the two cases a constant gets wrong: a card
+    that is not this card, and a card that is not empty. Both are ordinary —
+    someone else's GPU is a different size, and our own previous batch may not
+    have released cleanly when it crashed.
+    """
+    mem = _gpu_memory_gib()
+    if explicit is not None:
+        return explicit, f"explicit --gpu-mem-util {explicit}"
+    if mem is None:
+        # No driver reading. Fall back to something workable on the GPUs this
+        # is actually run on rather than to MinerU's 0.5, which is the value
+        # that failed.
+        return 0.85, "nvidia-smi unreadable; falling back to 0.85"
+
+    total, free = mem
+    util = min((free - GPU_MEM_RESERVE_GIB) / total, GPU_MEM_UTIL_MAX)
+    why = (f"{free:.1f} GiB free of {total:.1f}, holding back "
+           f"{GPU_MEM_RESERVE_GIB:.1f} -> {util:.3f}")
+
+    # Judge the projected KV cache in GiB, not the fraction. A fraction cannot
+    # answer this: 0.55 of an A100 is 44 GiB and ample, 0.70 of an 8 GiB card is
+    # 5.5 GiB and cannot even hold the engine. Only the absolute remainder says
+    # whether this will start.
+    projected_kv = total * util - GPU_ENGINE_FIXED_GIB
+    why += f", projected KV cache {projected_kv:.1f} GiB"
+    if projected_kv < GPU_MIN_KV_GIB:
+        why += (f" — TOO SMALL. The engine takes ~{GPU_ENGINE_FIXED_GIB:.1f} GiB "
+                f"(weights + profiling peak) before caching anything, and "
+                f"{free:.1f} GiB free does not leave a workable remainder. "
+                f"Free the GPU or use a larger one; parsing fewer pages will "
+                f"not help, because the peak is sized from the config, not the "
+                f"document.")
+    return util, why
 
 
 def _telemetry() -> dict:
@@ -319,7 +406,7 @@ def _telemetry() -> dict:
     volumes={"/root/.cache/huggingface": hf_cache, "/results": results},
 )
 def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
-               gpu_mem_util: float = GPU_MEM_UTIL) -> dict:
+               gpu_mem_util: "float | None" = GPU_MEM_UTIL) -> dict:
     """Runs every job in ONE container, sequentially.
 
     One container is the point: vLLM engine init costs 177–688 s and is paid per
@@ -340,6 +427,14 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
 
     telemetry = _telemetry()
     print(f"[kmc] hardware: {telemetry}", flush=True)
+
+    # Derived once per container: every job here shares the same GPU, and the
+    # value is recorded in the summary because it changes vLLM's batching and
+    # therefore, on this backend, which equations come back.
+    gpu_mem_util, why = _derive_gpu_mem_util(gpu_mem_util)
+    telemetry["gpu_mem_util"] = gpu_mem_util
+    telemetry["gpu_mem_util_why"] = why
+    print(f"[kmc] gpu-memory-utilization: {why}", flush=True)
 
     work = Path("/tmp/kmc")
     out: list[dict] = []
@@ -456,6 +551,28 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
             log += f"\n[kmc] killed: {stalled[0]} for >{stall_timeout_s}s\n"
         print(f"[kmc] {label} exited {rc} after {elapsed:.0f}s", flush=True)
 
+        # vLLM reports this as a knob to turn, which sends you looking for a
+        # setting when the real question is what else is holding the card. Say
+        # what was actually available, since we measured it.
+        if rc != 0 and "No available memory for the cache blocks" in log:
+            mem = _gpu_memory_gib()
+            # NOT `now` — that name is bound to time.monotonic in this function
+            # and the watchdog closes over it, so rebinding it here would leave
+            # the next job's watchdog calling a string.
+            free_now = (f"{mem[1]:.1f} GiB free of {mem[0]:.1f} right now"
+                        if mem else "GPU memory unreadable")
+            print(
+                f"[kmc] {label} DIAGNOSIS: vLLM had no room for a KV cache.\n"
+                f"[kmc]   ran at --gpu-memory-utilization {gpu_mem_util:.3f} ({why})\n"
+                f"[kmc]   {free_now}\n"
+                f"[kmc]   The engine needs ~2.2 GiB of weights plus ~8.1 GiB of\n"
+                f"[kmc]   profiling peak before any cache. If free memory looks\n"
+                f"[kmc]   ample, something did not release it — a previous batch\n"
+                f"[kmc]   in this container is the usual culprit. Otherwise use a\n"
+                f"[kmc]   larger GPU; this is not fixable by parsing fewer pages.",
+                flush=True,
+            )
+
         record: dict = {
             "label": label,
             "name": job["name"],
@@ -500,7 +617,9 @@ def main(
     batch_pages: int = 0,
     pages: str = "",
     layout: str = LAYOUT_S03,
-    gpu_mem_util: float = GPU_MEM_UTIL,
+    # Modal builds the CLI flag from this annotation, so it stays `float`
+    # rather than `float | None`; the default of 0 means "derive it".
+    gpu_mem_util: float = 0.0,
 ):
     """`--pdf` takes one path or several comma-separated.
 
@@ -622,7 +741,7 @@ def main(
         print(f"   {j['label']:38s} {rng}")
 
     t0 = time.perf_counter()
-    res = parse_jobs.remote(jobs, gpu_mem_util=gpu_mem_util)
+    res = parse_jobs.remote(jobs, gpu_mem_util=gpu_mem_util or None)
     wall = time.perf_counter() - t0
 
     print(f"\nhardware: {json.dumps(res['telemetry'], indent=None)}")
