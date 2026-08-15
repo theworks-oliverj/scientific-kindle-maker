@@ -498,11 +498,17 @@ that are easy to get backwards:
   of ordinary run-to-run variance.
 
 What *does* vary is how much of the card is free — a different GPU, another
-process, or a previous batch that did not release cleanly. So the fraction is
-**derived at run time from measured free memory**: take what is free, hold back
-2 GiB for the CUDA context and allocator slack, and express the rest as the
-fraction of total that vLLM expects. On an idle L4 that lands near `0.891` and
-turns 0.51 GiB of KV cache into roughly 9.3 GiB.
+process, or a previous batch in the same container that has not released its
+memory back to the driver yet. That last case is not hypothetical: a multi-batch
+book runs every job in one container to avoid paying vLLM's engine-init cost
+per batch, and the first attempt at this measured the free memory once for the
+whole container. Batch 1 legitimately used ~20.5 GiB; batch 2 started with only
+5.4 GiB actually free but was handed batch 1's fraction anyway, and failed the
+same way the original 0.5 default did. So the fraction is **derived fresh
+immediately before every job**, not once per container: take what is free right
+now, hold back 2 GiB for the CUDA context and allocator slack, and express the
+rest as the fraction of total that vLLM expects. On an idle L4 that lands near
+`0.891` and turns 0.51 GiB of KV cache into roughly 9.3 GiB.
 
 If the projection leaves under 1 GiB, the run says so with the numbers instead
 of letting vLLM fail 190 s later with a message that names a knob rather than

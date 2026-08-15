@@ -277,9 +277,12 @@ def _derive_gpu_mem_util(explicit: "float | None") -> tuple[float, str]:
     someone else's GPU is a different size, and our own previous batch may not
     have released cleanly when it crashed.
     """
-    mem = _gpu_memory_gib()
     if explicit is not None:
+        # Skip the nvidia-smi call entirely — an explicit value is pinned
+        # regardless of what it would read, and this now runs once per job in
+        # a multi-batch container rather than once per container.
         return explicit, f"explicit --gpu-mem-util {explicit}"
+    mem = _gpu_memory_gib()
     if mem is None:
         # No driver reading. Fall back to something workable on the GPUs this
         # is actually run on rather than to MinerU's 0.5, which is the value
@@ -428,14 +431,6 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
     telemetry = _telemetry()
     print(f"[kmc] hardware: {telemetry}", flush=True)
 
-    # Derived once per container: every job here shares the same GPU, and the
-    # value is recorded in the summary because it changes vLLM's batching and
-    # therefore, on this backend, which equations come back.
-    gpu_mem_util, why = _derive_gpu_mem_util(gpu_mem_util)
-    telemetry["gpu_mem_util"] = gpu_mem_util
-    telemetry["gpu_mem_util_why"] = why
-    print(f"[kmc] gpu-memory-utilization: {why}", flush=True)
-
     work = Path("/tmp/kmc")
     out: list[dict] = []
 
@@ -450,12 +445,24 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
         pdf_path = src_dir / job["name"]
         pdf_path.write_bytes(job["pdf"])
 
+        # Derived fresh for EVERY job, not once for the container. Measured
+        # this the expensive way: job 1 legitimately used ~20.5 GiB of a
+        # 22 GiB card; by the time job 2's subprocess started, the driver had
+        # not fully reclaimed it — 5.4 GiB was free, and job 2 got handed the
+        # stale fraction computed from job 1's headroom. "Every job here
+        # shares the same GPU" was true; "so the same fraction fits all of
+        # them" did not follow, and the two got conflated. An explicit
+        # override is still pinned across every job, since that is the user
+        # overriding the measurement on purpose.
+        job_util, job_why = _derive_gpu_mem_util(gpu_mem_util)
+        print(f"[kmc] {label} gpu-memory-utilization: {job_why}", flush=True)
+
         cmd = ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "vlm-engine"]
         if job.get("start") is not None and job.get("end") is not None:
             cmd += ["-s", str(job["start"]), "-e", str(job["end"])]
         # Unknown to mineru, forwarded verbatim to the vLLM server it starts.
         # Must come last: everything after this point is passthrough.
-        cmd += ["--gpu-memory-utilization", str(gpu_mem_util)]
+        cmd += ["--gpu-memory-utilization", str(job_util)]
 
         print(f"\n[kmc] === {label} ({i}/{len(jobs)}) ===", flush=True)
         print(f"[kmc] {' '.join(cmd)}", flush=True)
@@ -563,13 +570,16 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
                         if mem else "GPU memory unreadable")
             print(
                 f"[kmc] {label} DIAGNOSIS: vLLM had no room for a KV cache.\n"
-                f"[kmc]   ran at --gpu-memory-utilization {gpu_mem_util:.3f} ({why})\n"
-                f"[kmc]   {free_now}\n"
-                f"[kmc]   The engine needs ~2.2 GiB of weights plus ~8.1 GiB of\n"
-                f"[kmc]   profiling peak before any cache. If free memory looks\n"
-                f"[kmc]   ample, something did not release it — a previous batch\n"
-                f"[kmc]   in this container is the usual culprit. Otherwise use a\n"
-                f"[kmc]   larger GPU; this is not fixable by parsing fewer pages.",
+                f"[kmc]   ran at --gpu-memory-utilization {job_util:.3f} ({job_why})\n"
+                f"[kmc]   {free_now} — that is what it actually got, measured\n"
+                f"[kmc]   fresh for this job, so this is not the stale-derivation\n"
+                f"[kmc]   bug (fixed): the card had less free right now than the\n"
+                f"[kmc]   fraction above assumed. The GPU_MEM_RESERVE_GIB headroom\n"
+                f"[kmc]   was not enough this time, most likely because a job\n"
+                f"[kmc]   earlier in this container has not fully released its\n"
+                f"[kmc]   memory back to the driver yet. Re-running resumes from\n"
+                f"[kmc]   completed batches; if it recurs, raise the reserve or\n"
+                f"[kmc]   move this job to its own container.",
                 flush=True,
             )
 
@@ -581,6 +591,8 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
             "returncode": rc,
             "stalled": stalled[0],
             "elapsed_s": round(elapsed, 1),
+            "gpu_mem_util": job_util,
+            "gpu_mem_util_why": job_why,
             "log_tail": log[-3000:],
             "tar": None,
         }
