@@ -23,6 +23,11 @@ from ..observability.event_bus import EventBus
 from ..observability.logger import get_logger
 # Reuse the dynamic wrapper builder so package sets stay in sync with Stage 6
 from .s06_validation import _build_latex_wrapper, warm_up_tectonic
+# dvisvgm occasionally emits a <use> whose glyph it never defined — see
+# find_orphaned_use_refs. Stage 9 owns SVG-id logic; reused here rather than
+# duplicated so the two checks (this per-equation gate and Stage 10's
+# whole-document safety net) can never drift apart on what counts as orphaned.
+from .s09_svg_postprocess import find_orphaned_use_refs
 
 log = get_logger("s08a_svg_render")
 
@@ -198,6 +203,21 @@ def _render_region(
             else:
                 xdv_path = latex_to_xdv(latex, region.formula_class, work, tectonic_timeout)
             svg = xdv_to_svg(xdv_path, work, dvisvgm_timeout)
+
+            # dvisvgm's contract — every glyph a <use> draws is defined in
+            # this same render's own <defs> — does not always hold. When it
+            # doesn't, accepting the SVG anyway ships a silently incomplete
+            # equation; s10's whole-document check would catch it only after
+            # the entire book has been assembled, failing the whole run over
+            # one equation. Treat it as a render failure here instead, so it
+            # falls back to a raster crop like any other failed render and
+            # the rest of the book is unaffected.
+            orphans = find_orphaned_use_refs(svg)
+            if orphans:
+                raise SVGRenderError(
+                    f"{len(orphans)} glyph(s) referenced but never defined "
+                    f"by dvisvgm: {sorted(orphans)[:3]}"
+                )
 
         region.svg = svg
         cache.put(latex, svg, region.cdm_score or 0.0)

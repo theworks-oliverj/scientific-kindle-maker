@@ -67,6 +67,16 @@ image = (
             "HF_HUB_DISABLE_XET": "1",  # Xet transfers stall on some networks
             "MINERU_MODEL_SOURCE": "huggingface",
             "PYTHONUNBUFFERED": "1",
+            # vLLM's own memory-accounting breakdown ("Memory profiling
+            # results: ... peak_torch_memory=... non_torch_memory=...") is
+            # logged at DEBUG, not INFO — confirmed against vllm's source
+            # (gpu_worker.py logs the memory snapshot via logger.debug).
+            # Without this, the ONE piece of evidence that names which
+            # internal term is responsible for a KV-cache failure never
+            # reaches our logs at all — which is exactly what happened
+            # investigating the derivation that failed 2026-08-14 (see
+            # modal-cost-model). Costs more log text, not more compute.
+            "VLLM_LOGGING_LEVEL": "DEBUG",
         }
     )
 )
@@ -131,6 +141,72 @@ SCALEDOWN_WINDOW_S = 2
 # narrow that is a bad trade — and the spread it would address was never even
 # isolated (see the README's note on that flawed experiment).
 
+# How much of the GPU vLLM may use.
+#
+# MinerU leaves this at 0.5 — half the card, whatever the card is — and on the
+# first real book that was not enough: it aborted with "No available memory for
+# the cache blocks" before reading a page.
+#
+# TRIED AND ABANDONED: deriving the fraction from free memory measured at run
+# time (take what nvidia-smi reports free, hold back a reserve, scale to that).
+# It looked right — one run measured 22.0 GiB free, derived 0.891, and got
+# 13.46 GiB of KV cache. The SAME derivation, on the SAME book, SAME page
+# range, with nvidia-smi again reporting 22.0 GiB free, then produced -0.92 GiB
+# and failed the same way. Fixed cost (everything vLLM needs before any KV
+# cache exists) measured 7.0 GiB on the successful run and 21.4 GiB on the
+# failed one — a 3x swing with no observable difference in the inputs. This
+# vLLM build does not print the "Memory profiling results" line that would
+# name which internal term varies, so the mechanism is unconfirmed — but
+# nvidia-smi's externally-visible "free" number evidently cannot predict it.
+# Do not resurrect free-memory derivation without that missing evidence.
+#
+# WHAT IS PROVEN INSTEAD: Frankel completed a real book on 0.51 GiB of actual
+# KV cache. The parse does not need a large cache — it needs the fixed cost to
+# fit at all. So this is now a small FIXED ladder, not a derivation, with
+# real headroom below even the worst fixed cost observed so far (21.4 GiB out
+# of 23):
+GPU_MEM_UTIL_LADDER: "tuple[float, ...]" = (0.70, 0.55)
+
+# Lower rungs are not only more headroom — they plausibly lower the fixed cost
+# too. vLLM chooses how many CUDA-graph shapes to capture from the budget it is
+# given, so a smaller ask means a smaller graph pool, not just a smaller
+# request. This is consistent with Frankel's 0.50 run needing only 10.74 GiB
+# fixed cost against the failed Hartmann run's 21.4 at 0.891 — unconfirmed for
+# the same reason as above, but the direction of the retry is right either way.
+#
+# Retried only on the specific error vLLM raises for this condition — it names
+# the exact thing that went wrong, so retrying on it is a targeted response to
+# a known failure mode, not a blind "try again". Any other failure (a crash, a
+# stall) is not retried; the ladder is not a general fix for a bad run.
+#
+# Explicit --gpu-mem-util skips the ladder and pins exactly that value, once,
+# with no fallback substitution — that is the point of overriding it.
+GPU_MEM_UTIL: "float | None" = None
+
+# Before spending a subprocess launch on a rung, check whether the card
+# plainly cannot supply it: requesting more than nvidia-smi reports free right
+# now cannot succeed regardless of anything vLLM does internally, so there is
+# nothing to learn by trying. This is deliberately coarse — a floor, not a
+# prediction — because a precise prediction is exactly the approach that just
+# failed twice. A prior version of this check computed a precise-looking
+# projection, printed "TOO SMALL", and then ran the doomed attempt anyway,
+# burning 85 s to confirm what the projection already said. This one skips.
+GPU_MEM_SAFETY_MARGIN_GIB = 0.5
+
+# How much of each mineru output line to echo. This was 150, chosen to keep a
+# tqdm bar readable, and it silently cost a diagnosis: vLLM reports its memory
+# budget as one long line —
+#
+#   Memory profiling results: ... total_gpu_memory=22.49GiB
+#   initial_memory_usage=... peak_torch_memory=... non_torch_memory=...
+#   gpu_memory_utilization=0.90
+#
+# — and every number in it sits past column 150. When the first real book died
+# on "No available memory for the cache blocks", the one line that would have
+# explained why had been cut off before it reached the log. Wide enough for that
+# line now; still bounded, because vLLM also prints multi-KB config dumps.
+LOG_LINE_CHARS = 600
+
 # tqdm writes "<done>/<total>" — e.g. "Predict:  48%|####  | 94/197 [01:13<...]".
 # That counter is the only trustworthy evidence that work is actually moving;
 # the surrounding text redraws whether or not it is.
@@ -183,6 +259,22 @@ def _batch_dir_name(start: int, end: int) -> str:
     return f"batch_{start:05d}_{end:05d}"
 
 
+def _gpu_memory_gib() -> "tuple[float, float] | None":
+    """(total, free) GiB from the driver, or None if it cannot be read."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip().splitlines()[0]
+        total_mib, free_mib = (float(x.strip()) for x in out.split(","))
+        return total_mib / 1024, free_mib / 1024
+    except Exception:
+        return None
+
+
 def _telemetry() -> dict:
     """What we actually got, not what the host happens to have.
 
@@ -198,9 +290,23 @@ def _telemetry() -> dict:
 
     out: dict[str, object] = {}
 
+    # memory.used and memory.free, not just total. `total` says the card is a
+    # 23 GB L4 and nothing more; when vLLM refuses to start because there is
+    # "no available memory for the cache blocks", the only question that matters
+    # is how much of that 23 GB was already gone before we asked — and total
+    # cannot answer it. Learned the hard way on the first real book.
+    #
+    # uuid is the one field that lets a later investigation answer "was this
+    # the SAME physical card as last time". Two runs on this project produced
+    # a 3x swing in fixed cost (7 vs 21 GiB) with identical inputs by every
+    # OTHER measure we had — model name and driver version cannot distinguish
+    # one L4 from another, and that gap is exactly the missing evidence for
+    # deciding host-heterogeneity vs something in our own request. See
+    # modal-cost-model.
     try:
         gpu = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+            ["nvidia-smi",
+             "--query-gpu=name,memory.total,memory.used,memory.free,driver_version,uuid",
              "--format=csv,noheader"],
             capture_output=True, text=True, timeout=30,
         )
@@ -263,6 +369,18 @@ def _telemetry() -> dict:
                 break
     except Exception:
         pass
+
+    # Modal's own container identifiers, set automatically in every container
+    # (confirmed against Modal's docs — not something we configure). The point
+    # is not using these ourselves; it is having them ON HAND the moment a
+    # hardware anomaly needs escalating to Modal support. Discovering after
+    # the fact that a container's identity was never recorded means the report
+    # is "this GPU model sometimes misbehaves" instead of "this specific task
+    # ID, on this specific host, at this timestamp" — the difference between
+    # an anecdote and something they can actually investigate.
+    for var in ("MODAL_TASK_ID", "MODAL_CLOUD_PROVIDER", "MODAL_REGION",
+                "MODAL_IMAGE_ID"):
+        out[var.lower()] = os.environ.get(var)
     return out
 
 
@@ -275,7 +393,8 @@ def _telemetry() -> dict:
     scaledown_window=SCALEDOWN_WINDOW_S,
     volumes={"/root/.cache/huggingface": hf_cache, "/results": results},
 )
-def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict:
+def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
+               gpu_mem_util: "float | None" = GPU_MEM_UTIL) -> dict:
     """Runs every job in ONE container, sequentially.
 
     One container is the point: vLLM engine init costs 177–688 s and is paid per
@@ -311,103 +430,208 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict
         pdf_path = src_dir / job["name"]
         pdf_path.write_bytes(job["pdf"])
 
-        cmd = ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "vlm-engine"]
-        if job.get("start") is not None and job.get("end") is not None:
-            cmd += ["-s", str(job["start"]), "-e", str(job["end"])]
-
         print(f"\n[kmc] === {label} ({i}/{len(jobs)}) ===", flush=True)
-        print(f"[kmc] {' '.join(cmd)}", flush=True)
-        t0 = time.perf_counter()
 
-        # Stream rather than capture: capture_output=True buffers until exit,
-        # which here means minutes of silence indistinguishable from a hang.
-        # A watchdog thread reads the clock while the main thread reads output —
-        # if output stops, the parse is stuck and the container is burning money
-        # for nothing, so kill it instead of waiting out the function timeout.
-        lines: list[str] = []
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-        )
-        assert proc.stdout is not None
+        def _attempt(cmd: list[str]) -> tuple[int, float, str, str]:
+            """Runs one mineru invocation to completion.
 
-        # Watching for *output* is not enough. A process can keep printing while
-        # the work behind it is wedged — a redrawing progress bar or a heartbeat
-        # log looks identical to progress from the outside. So the watchdog
-        # tracks the progress COUNTER (tqdm's "94/197") and requires it to
-        # advance. Chatty-but-frozen is the failure this catches; silence is
-        # only the easy case.
-        #
-        # Before any counter exists (vLLM init prints plenty and counts
-        # nothing), it falls back to time-since-output, which is the right
-        # measure for that phase.
-        lines: list[str] = []
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-        )
-        assert proc.stdout is not None
+            Returns (returncode, elapsed_s, combined_log, stall_reason). Pulled
+            out of the per-job body so the memory ladder below can call it once
+            per rung without duplicating the subprocess/watchdog machinery.
+            """
+            print(f"[kmc] {' '.join(cmd)}", flush=True)
+            t0 = time.perf_counter()
 
-        now = time.monotonic
-        last_output = [now()]
-        last_advance = [now()]
-        progress: list[tuple[int, int] | None] = [None]  # (done, total), None until seen
-        stalled = [""]
+            # Stream rather than capture: capture_output=True buffers until
+            # exit, which here means minutes of silence indistinguishable from
+            # a hang. A watchdog thread reads the clock while the main thread
+            # reads output — if output stops, the parse is stuck and the
+            # container is burning money for nothing, so kill it instead of
+            # waiting out the function timeout.
+            lines: list[str] = []
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            assert proc.stdout is not None
 
-        def watchdog() -> None:
-            beat = now()
-            while proc.poll() is None:
-                t = now()
-                tracking = progress[0] is not None
-                # Once a counter exists, frozen progress is the signal. Until
-                # then, silence is.
-                quiet = t - (last_advance[0] if tracking else last_output[0])
+            # Watching for *output* is not enough. A process can keep printing
+            # while the work behind it is wedged — a redrawing progress bar or
+            # a heartbeat log looks identical to progress from the outside. So
+            # the watchdog tracks the progress COUNTER (tqdm's "94/197") and
+            # requires it to advance. Chatty-but-frozen is the failure this
+            # catches; silence is only the easy case.
+            #
+            # Before any counter exists (vLLM init prints plenty and counts
+            # nothing), it falls back to time-since-output, which is the right
+            # measure for that phase.
+            now = time.monotonic
+            last_output = [now()]
+            last_advance = [now()]
+            progress: list[tuple[int, int] | None] = [None]  # None until seen
+            stalled = [""]
 
-                if t - beat >= 60:  # visibility while it is healthy
-                    beat = t
-                    where = f"progress {progress[0][0]}/{progress[0][1]}" if tracking else "starting up"
-                    print(
-                        f"[kmc] {label} alive — {where}, "
-                        f"{quiet:.0f}s since last advance (limit {stall_timeout_s}s)",
-                        flush=True,
-                    )
+            def watchdog() -> None:
+                beat = now()
+                while proc.poll() is None:
+                    t = now()
+                    tracking = progress[0] is not None
+                    # Once a counter exists, frozen progress is the signal.
+                    # Until then, silence is.
+                    quiet = t - (last_advance[0] if tracking else last_output[0])
 
-                if quiet > stall_timeout_s:
-                    stalled[0] = (
-                        f"progress frozen at {progress[0][0]}/{progress[0][1]}"
-                        if tracking else "no output"
-                    )
-                    print(
-                        f"[kmc] {label} STALLED — {stalled[0]} for {quiet:.0f}s "
-                        f"(limit {stall_timeout_s}s); killing",
-                        flush=True,
-                    )
-                    proc.kill()
-                    return
-                time.sleep(5)
+                    if t - beat >= 60:  # visibility while it is healthy
+                        beat = t
+                        where = (f"progress {progress[0][0]}/{progress[0][1]}"
+                                 if tracking else "starting up")
+                        print(
+                            f"[kmc] {label} alive — {where}, "
+                            f"{quiet:.0f}s since last advance (limit {stall_timeout_s}s)",
+                            flush=True,
+                        )
 
-        watch = threading.Thread(target=watchdog, daemon=True)
-        watch.start()
+                    if quiet > stall_timeout_s:
+                        stalled[0] = (
+                            f"progress frozen at {progress[0][0]}/{progress[0][1]}"
+                            if tracking else "no output"
+                        )
+                        print(
+                            f"[kmc] {label} STALLED — {stalled[0]} for {quiet:.0f}s "
+                            f"(limit {stall_timeout_s}s); killing",
+                            flush=True,
+                        )
+                        proc.kill()
+                        return
+                    time.sleep(5)
 
-        for line in proc.stdout:
-            last_output[0] = now()
-            lines.append(line)
-            # tqdm renders "<done>/<total>"; a change in either element counts
-            # as advancing, so moving between phases (layout -> content) is not
-            # mistaken for a stall.
-            m = _PROGRESS_RE.search(line)
-            if m:
-                state = (int(m.group(1)), int(m.group(2)))
-                if state != progress[0]:
-                    progress[0] = state
-                    last_advance[0] = now()
-            print(f"[mineru:{label}] {line.rstrip()[:150]}", flush=True)
-        rc = proc.wait()
-        watch.join(timeout=10)
-        elapsed = time.perf_counter() - t0
-        log = "".join(lines)
-        if stalled[0]:
-            rc = rc or -1
-            log += f"\n[kmc] killed: {stalled[0]} for >{stall_timeout_s}s\n"
-        print(f"[kmc] {label} exited {rc} after {elapsed:.0f}s", flush=True)
+            watch = threading.Thread(target=watchdog, daemon=True)
+            watch.start()
+
+            for line in proc.stdout:
+                last_output[0] = now()
+                lines.append(line)
+                # tqdm renders "<done>/<total>"; a change in either element
+                # counts as advancing, so moving between phases (layout ->
+                # content) is not mistaken for a stall.
+                m = _PROGRESS_RE.search(line)
+                if m:
+                    state = (int(m.group(1)), int(m.group(2)))
+                    if state != progress[0]:
+                        progress[0] = state
+                        last_advance[0] = now()
+                print(f"[mineru:{label}] {line.rstrip()[:LOG_LINE_CHARS]}", flush=True)
+            rc = proc.wait()
+            watch.join(timeout=10)
+            elapsed = time.perf_counter() - t0
+            log = "".join(lines)
+            if stalled[0]:
+                rc = rc or -1
+                log += f"\n[kmc] killed: {stalled[0]} for >{stall_timeout_s}s\n"
+            print(f"[kmc] {label} exited {rc} after {elapsed:.0f}s", flush=True)
+            return rc, elapsed, log, stalled[0]
+
+        # An explicit value is used exactly once, with no fallback — that is
+        # the point of overriding it. Otherwise, step down the ladder.
+        candidates = ([gpu_mem_util] if gpu_mem_util is not None
+                      else list(GPU_MEM_UTIL_LADDER))
+
+        rc, elapsed, log, stall_reason = -1, 0.0, "", ""
+        total_elapsed = 0.0
+        used_util: "float | None" = None
+        used_why = ""
+        attempts_log: list[dict] = []
+        # Every rung's full output, not just the last one. A ladder job that
+        # fails rung 1 and succeeds on rung 2 used to discard rung 1's
+        # traceback entirely — exactly the evidence that would explain why the
+        # first rung failed. Reassigning `log` each iteration only feeds the
+        # per-attempt DIAGNOSIS check below; this list is what survives into
+        # the record.
+        full_log_parts: list[str] = []
+
+        for rung, util in enumerate(candidates, 1):
+            source = (f"explicit --gpu-mem-util {util}" if gpu_mem_util is not None
+                      else f"ladder rung {rung}/{len(candidates)}: {util}")
+
+            # Do not spend a subprocess launch on a request the card plainly
+            # cannot supply — asking for more than is measured free right now
+            # cannot succeed no matter what vLLM does internally, so there is
+            # nothing to learn by trying. This check is deliberately coarse
+            # (a floor, not a projection): a precise-looking projection is
+            # exactly what failed twice already tonight.
+            mem = _gpu_memory_gib()
+            if mem is not None:
+                total, free = mem
+                needed = util * total
+                if needed > free - GPU_MEM_SAFETY_MARGIN_GIB:
+                    used_why = (f"{source} needs ~{needed:.1f} GiB but only "
+                                f"{free:.1f} GiB is free (of {total:.1f}) — "
+                                f"skipped, mineru was not launched")
+                    print(f"[kmc] {label} {used_why}", flush=True)
+                    attempts_log.append({"util": util, "skipped": True})
+                    used_util = util
+                    continue
+
+            print(f"[kmc] {label} gpu-memory-utilization: {source}", flush=True)
+            # Start from an empty directory on every attempt: a rung that
+            # failed at engine init should not leave anything behind for the
+            # next rung to trip over, even though mineru fails before writing
+            # page output this early.
+            shutil.rmtree(out_dir, ignore_errors=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            cmd = ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "vlm-engine"]
+            if job.get("start") is not None and job.get("end") is not None:
+                cmd += ["-s", str(job["start"]), "-e", str(job["end"])]
+            # Unknown to mineru, forwarded verbatim to the vLLM server it
+            # starts. Must come last: everything after this point is
+            # passthrough.
+            cmd += ["--gpu-memory-utilization", str(util)]
+
+            rc, elapsed, log, stall_reason = _attempt(cmd)
+            total_elapsed += elapsed
+            used_util, used_why = util, source
+            attempts_log.append({
+                "util": util, "skipped": False, "returncode": rc,
+                "elapsed_s": round(elapsed, 1),
+            })
+            full_log_parts.append(
+                f"===== {label} rung {rung}/{len(candidates)} util={util} "
+                f"rc={rc} elapsed={elapsed:.0f}s =====\n{log}"
+            )
+
+            if rc == 0:
+                break
+
+            # Retried only on the specific condition vLLM names — it is a
+            # targeted response to a known failure mode, not a blind retry.
+            # A stall, a crash, anything else: stop here, this job failed.
+            no_kv_room = "No available memory for the cache blocks" in log
+            if no_kv_room and rung < len(candidates):
+                print(f"[kmc] {label} rung {rung}/{len(candidates)} had no room "
+                      f"for a KV cache; trying the next rung", flush=True)
+                continue
+            break
+
+        # vLLM reports this as a knob to turn, which sends you looking for a
+        # setting when the real question is what else is holding the card. Say
+        # what was actually available, and what was already tried.
+        if rc != 0 and "No available memory for the cache blocks" in log:
+            mem = _gpu_memory_gib()
+            free_now = (f"{mem[1]:.1f} GiB free of {mem[0]:.1f} right now"
+                        if mem else "GPU memory unreadable")
+            tried = ", ".join(str(a["util"]) for a in attempts_log if not a["skipped"])
+            print(
+                f"[kmc] {label} DIAGNOSIS: vLLM never found room for a KV cache.\n"
+                f"[kmc]   tried: {tried or '(nothing — skipped by the free-memory check)'}\n"
+                f"[kmc]   {free_now}\n"
+                f"[kmc]   This is the fixed-cost variance on record: the same book at\n"
+                f"[kmc]   the same utilization has measured anywhere from 7 to 21 GiB\n"
+                f"[kmc]   of cost before any KV cache exists, with no observed\n"
+                f"[kmc]   difference in the inputs — see modal-cost-model. Re-running\n"
+                f"[kmc]   resumes from completed batches. If every rung keeps failing,\n"
+                f"[kmc]   this GPU class may not reliably fit the engine at all.",
+                flush=True,
+            )
 
         record: dict = {
             "label": label,
@@ -415,9 +639,20 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S) -> dict
             "start": job.get("start"),
             "end": job.get("end"),
             "returncode": rc,
-            "stalled": stalled[0],
-            "elapsed_s": round(elapsed, 1),
-            "log_tail": log[-3000:],
+            "stalled": stall_reason,
+            "elapsed_s": round(total_elapsed, 1),
+            "gpu_mem_util": used_util,
+            "gpu_mem_util_why": used_why,
+            "gpu_mem_attempts": attempts_log,
+            # Untruncated, every rung. The 3000-char cut this replaced is what
+            # turned a real traceback into 30-odd lines of a 200+ line error —
+            # discovered only when trying to file an evidence-based report
+            # after the fact and finding the evidence had been thrown away at
+            # the point of capture. This is plain text; there is no billing
+            # reason to bound it, only a legibility one, and the entrypoint
+            # writes it to its own file rather than cramming it into a
+            # terminal.
+            "log_full": "\n\n".join(full_log_parts),
             "tar": None,
         }
 
@@ -453,6 +688,9 @@ def main(
     batch_pages: int = 0,
     pages: str = "",
     layout: str = LAYOUT_S03,
+    # Modal builds the CLI flag from this annotation, so it stays `float`
+    # rather than `float | None`; the default of 0 means "derive it".
+    gpu_mem_util: float = 0.0,
 ):
     """`--pdf` takes one path or several comma-separated.
 
@@ -473,15 +711,32 @@ def main(
     import json
     import tarfile
     import time
+    import uuid
     from pathlib import Path
 
     if layout not in (LAYOUT_S03, LAYOUT_LABELLED):
         raise SystemExit(f"--layout must be {LAYOUT_S03} or {LAYOUT_LABELLED}")
 
-    paths = [Path(p.strip()) for p in pdf.split(",") if p.strip()]
-    for p in paths:
-        if not p.is_file():
-            raise SystemExit(f"not a file: {p}")
+    # A path that exists is never a list, whatever punctuation is in it.
+    # Academic PDFs are routinely named "Lastname, Firstname.pdf", and splitting
+    # those on the comma turns one real file into two paths that do not exist —
+    # so check the whole string before treating the comma as a separator.
+    raw = pdf.strip()
+    if Path(raw).is_file():
+        paths = [Path(raw)]
+    else:
+        paths = [Path(p.strip()) for p in raw.split(",") if p.strip()]
+    missing = [p for p in paths if not p.is_file()]
+    if missing:
+        # Name every miss, and say what the string was read as. A comma in a
+        # filename otherwise shows up as a puzzling "no such file" naming a
+        # path the user never typed.
+        detail = "\n".join(f"  not a file: {p}" for p in missing)
+        raise SystemExit(
+            f"--pdf did not resolve:\n{detail}\n"
+            f"(read as {len(paths)} path(s); --pdf splits on commas, so a comma "
+            f"in a filename must be a path that exists as given)"
+        )
 
     # The s03 layout keys directories on page range alone, so anything that
     # produces two jobs with the same range writes them to the same place and
@@ -558,7 +813,7 @@ def main(
         print(f"   {j['label']:38s} {rng}")
 
     t0 = time.perf_counter()
-    res = parse_jobs.remote(jobs)
+    res = parse_jobs.remote(jobs, gpu_mem_util=gpu_mem_util or None)
     wall = time.perf_counter() - t0
 
     print(f"\nhardware: {json.dumps(res['telemetry'], indent=None)}")
@@ -591,25 +846,53 @@ def main(
         print(f"{rec['label']:40s} {rec['returncode']:>3} {rec['elapsed_s']:>7.0f}  {note}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = (work_dir if layout == LAYOUT_S03 else root) / "remote_run_summary.json"
+
+    # Timestamped, never overwritten. `remote_run_summary.json` used to live at
+    # one fixed path per output-root, so a retry against the same book — the
+    # ordinary case after a failure — silently replaced the failed attempt's
+    # summary with the new one. That is precisely how this project lost its
+    # own evidence of two real GPU-memory failures: the retry that eventually
+    # succeeded overwrote the record of the ones that didn't, on a platform
+    # whose own log retention (`modal app logs` returns at most the last 100
+    # entries; the web dashboard keeps 24h) cannot be relied on to have kept a
+    # second copy. Every attempt's summary AND every job's full, untruncated
+    # output now land under their own run directory instead.
+    # Second-resolution alone is not enough: caught by testing, not by
+    # inspection — two invocations within the same wall-clock second (a quick
+    # manual retry, or any future automated one) landed on the identical
+    # directory name and the second run clobbered the first, reproducing the
+    # exact bug this mechanism exists to close. A random suffix makes a
+    # collision require both the same second AND the same one-in-16M draw.
+    run_ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    run_dir = root / "_run_logs" / f"{run_ts}-{uuid.uuid4().hex[:6]}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    for rec in res["jobs"]:
+        (run_dir / f"{rec['label']}.log").write_text(rec.get("log_full") or "")
+
+    summary_path = run_dir / "remote_run_summary.json"
     summary = {
         "layout": layout,
         "batch_pages": batch_pages,
         "telemetry": res["telemetry"],
         "wall_s": round(wall, 1),
-        "jobs": [{k: v for k, v in r.items() if k != "tar"} for r in res["jobs"]],
+        # log_full already lives in its own per-job .log file next to this
+        # summary — keeping it here too would just duplicate potentially
+        # large text inside a JSON blob for no reader's benefit.
+        "jobs": [{k: v for k, v in r.items() if k not in ("tar", "log_full")}
+                 for r in res["jobs"]],
     }
     summary_path.write_text(json.dumps(summary, indent=2))
-    print(f"\nsummary + logs: {summary_path}")
+    print(f"\nsummary + logs: {run_dir}")
 
     if layout == LAYOUT_S03:
         _verify_s03_layout(written, work_dir, batch_pages, paths[0], output_root)
 
     failed = [r for r in res["jobs"] if r["returncode"] != 0]
     if failed:
-        print(f"\n{len(failed)} job(s) failed:")
+        print(f"\n{len(failed)} job(s) failed — full output in {run_dir}:")
         for r in failed:
-            print(f"--- {r['label']} ---\n{r['log_tail'][-1200:]}")
+            print(f"--- {r['label']} ---\n{(r.get('log_full') or '')[-1200:]}")
 
 
 def _verify_s03_layout(written, work_dir, batch_pages, pdf_path, output_root) -> None:

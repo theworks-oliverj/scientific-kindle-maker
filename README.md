@@ -466,6 +466,134 @@ yourself.
 Failed batches are not fatal. Each one commits to a Modal Volume as it finishes,
 so re-running the same command fills in only what is missing.
 
+### How much GPU memory the engine gets
+
+MinerU runs vLLM at `gpu_memory_utilization=0.5` — half the card, whatever the
+card is. On a 23 GiB L4 that budgets ~11.25 GiB, and the engine spends almost
+all of it before caching anything: 2.16 GiB of model weights plus what vLLM
+calls its activation/profiling peak, sized from `max_model_len` and the
+config's maximum feature size — **not from the pages of the document in front
+of it**. Two consequences that are easy to get backwards: parsing fewer pages
+per batch does not help (the peak is per-engine, not per-batch), and a denser
+or higher-resolution book does not make it worse.
+
+**A first fix derived the fraction from measured free memory at run time, and
+it did not hold up.** One run measured 22.0 GiB free, derived a fraction, and
+completed with 13.46 GiB of KV cache to spare. The exact same derivation, on
+the exact same book and page range, with nvidia-smi again reporting 22.0 GiB
+free, then produced −0.92 GiB and failed. Fixed cost — everything vLLM needs
+before any KV cache exists — measured 7.0 GiB on the run that worked and
+21.4 GiB on the one that didn't, a 3× swing with no observable difference in
+the inputs. This vLLM build does not print the internal breakdown that would
+name which term varies, so the mechanism stays unconfirmed; what's confirmed
+is that nvidia-smi's externally visible "free" number cannot predict it.
+
+**So this is now a small fixed ladder, not a derivation.** Two rungs, tried in
+order: `0.70`, then `0.55` if that specific failure recurs. Real headroom below
+even the worst fixed cost observed so far (21.4 of 23 GiB), on the strength of
+what Frankel already proved: the parse only needs ~0.5 GiB of actual KV cache
+to complete a real book, so a fixed value with slack beats a clever prediction
+that has now failed twice on identical inputs. Lower rungs are plausibly not
+just more headroom but a lower fixed cost too — vLLM chooses how many CUDA-graph
+shapes to capture from the budget it's given, so a smaller ask may mean a
+smaller graph pool, not just a smaller request. Consistent with the run at 0.50
+needing only 10.74 GiB fixed cost against the failed run's 21.4 at 0.891 —
+suggestive, not proven.
+
+**The retry is targeted, not blind.** Only the specific error vLLM raises for
+this condition — `No available memory for the cache blocks` — triggers the next
+rung. A stall, a crash, anything else stops there; the ladder is not a general
+retry-on-any-failure mechanism. And before spending a subprocess launch on a
+rung, a coarse check asks whether the card can plainly supply it: if the rung's
+request exceeds what's measured free right now, minus a small safety margin,
+it's skipped without launching mineru. This is a floor, not a projection — a
+precise-looking projection is exactly what failed twice; the fix is not a
+smarter prediction, it's a targeted retry backed by evidence a rung is
+literally impossible before spending money to confirm it.
+
+Override with `--gpu-mem-util 0.85` to pin a single value with no ladder — that
+is the point of overriding it.
+
+**What's proven and what isn't, after 4 real batches on 2 real books**
+(2026-08-14/15): every one succeeded on **rung 1**, at an identical 11.74 GiB
+of KV cache each time. Rung 2 has never fired. Read that precisely:
+
+- **Proven:** a small fixed value (0.70) reliably clears whatever the earlier
+  failures hit — 4/4, not a guess holding up so far.
+- **Not proven:** the retry itself. Zero exercised evidence either way for
+  whether rung 2 would rescue an actual rung-1 failure.
+- **Not true:** "the fix wasn't needed." MinerU's raw 0.5 default failed on
+  the very first real attempt, before any of this existed. The derived value
+  in between (~0.89) also failed, twice, unpredictably. Only 0.70-fixed has
+  held.
+
+**Why fixed cost swings 7 → 21 GiB on identical inputs is still an open
+question**, not a solved one. Two hypotheses, not distinguished by anything
+collected so far: Modal host/hardware heterogeneity (different physical L4s,
+or the same one under different neighbour load), or vLLM/CUDA-graph internal
+nondeterminism in how its profiling step scales graph-capture range with the
+budget it's given. What would settle it — vLLM's own memory decomposition
+(`peak_torch_memory`, `non_torch_memory`, etc.) — was invisible before: it is
+logged at DEBUG in vLLM's source, and the image never set a logging level. It
+now does; see below.
+
+**Downstream effects, since this is not only a reliability setting:**
+
+- **Throughput and cost.** A smaller KV cache than the derivation would have
+  given means fewer concurrent sequences, so the expected effect is somewhat
+  slower per rung actually used. Unmeasured against the ladder; the baseline is
+  2.6 s/page from Frankel's original 0.5 run.
+- **Recognition output.** GPU parses are already non-reproducible because batch
+  composition changes the order of floating-point reductions; KV cache size
+  changes how requests get batched, so **which rung a job lands on changes
+  which equations come back**. Not worse, but a snapshot from one rung isn't a
+  fair baseline for another. Every attempt — including skipped and failed
+  rungs — is recorded per job under `gpu_mem_attempts` in
+  `<output-root>/_run_logs/<timestamp>/remote_run_summary.json`, for exactly
+  this reason. See [Verifying a parser change](#verifying-a-parser-change).
+- **Failure cost.** A rung that's tried and fails costs real GPU time (~190 s
+  observed) before the next one starts; a rung that's skipped by the free-memory
+  check costs nothing.
+
+### What gets logged, and why it has to be captured here
+
+**Modal's own log retention is short and not something to rely on.**
+Confirmed 2026-08-15: `modal app logs` returns at most the last 100 entries
+(`modal app logs --help` says so outright), and `modal app list` had already
+stopped listing two apps involved in a real incident less than 24 hours after
+it happened. The web dashboard is reported to keep roughly a day. If something
+worth investigating happens on a run, Modal's side of the record is gone
+within about a day whether or not anyone looked.
+
+So every run writes its own durable, timestamped archive —
+`<output-root>/_run_logs/<UTC-timestamp>-<random>/` — holding
+`remote_run_summary.json` and one full, untruncated `<label>.log` per job.
+Timestamped rather than fixed-path on purpose: a fixed path meant a retry
+against the same book (the ordinary case right after any failure) silently
+overwrote the previous attempt's summary, which is how a real incident on this
+project briefly lost its own evidence a few hours before someone tried to
+write it up. The directory name adds a random suffix on top of the timestamp,
+since two runs launched within the same second would otherwise collide too —
+found by testing this specific scenario, not by inspection.
+
+What's captured, so a hardware anomaly can actually be escalated rather than
+just described:
+
+- **`VLLM_LOGGING_LEVEL=DEBUG`**, set in the image. vLLM's own memory
+  decomposition is logged at DEBUG, not INFO — without this, the one line that
+  would name which internal term is responsible for a memory failure never
+  reached the log at all. Costs more log text, not more compute.
+- **GPU UUID**, not just model name and driver version — the one field that
+  can prove or disprove "was this the same physical card" across two runs with
+  otherwise-identical readings.
+- **Modal's own container identifiers** — `MODAL_TASK_ID`, `MODAL_CLOUD_PROVIDER`,
+  `MODAL_REGION`, `MODAL_IMAGE_ID` — set automatically in every container
+  (confirmed against Modal's docs). The difference between "this GPU model
+  sometimes misbehaves" and something Modal support can actually look up.
+- **Every ladder rung's full output**, not just the last one tried. A job that
+  fails rung 1 and succeeds on rung 2 used to discard rung 1's traceback
+  entirely — the attempt most likely to be interesting.
+
 ### Working out what a GPU run costs
 
 > **Rates below were captured on 2026-08-12 and verified against one real
@@ -1064,6 +1192,21 @@ carries on the order of a dozen quiet errors. This is a known, accepted gap.
 **Very complex multi-line equation arrays** — `\begin{align}` blocks that
 span many lines sometimes get split across multiple detected regions or
 recognised incorrectly. Check the report for these.
+
+**`\widehat` / `\boldsymbol` notation occasionally falls back to a raster
+crop.** dvisvgm (the SVG renderer) has a known, non-deterministic bug —
+[mgieseki/dvisvgm#129](https://github.com/mgieseki/dvisvgm/issues/129) —
+where it emits a glyph reference with no matching definition, on versions
+≥2.8.2 (this project runs 3.6). Investigated on a 3,899-equation book: ruled
+out concurrency as the cause (a fully serial re-render produced the exact
+same 39 failures, byte-identical), and found instead a strong correlation
+(~29×) with `\widehat` and `\boldsymbol` — both pull glyphs from font
+resources ordinary equations rarely touch. Books using hat/bold-vector
+notation heavily (common in stochastic processes, control theory, some
+mechanics texts) will likely see a handful of equations fall back to page
+crops rather than render as scalable SVG. Not a bug in this pipeline; each
+affected equation is caught and degrades to a raster crop of the real
+equation automatically, never silently missing content.
 
 **Tables containing equations** — tables are inlined as HTML when MinerU's
 output parses as valid `<table>` markup, and fall back to a page-image crop
