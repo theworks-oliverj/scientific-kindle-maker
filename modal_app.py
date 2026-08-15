@@ -134,54 +134,54 @@ SCALEDOWN_WINDOW_S = 2
 # How much of the GPU vLLM may use.
 #
 # MinerU leaves this at 0.5 — half the card, whatever the card is — and on the
-# first real book that was not enough. Measured on an L4 with the GPU otherwise
-# idle (22.5 GiB of 22.49 GiB free):
+# first real book that was not enough: it aborted with "No available memory for
+# the cache blocks" before reading a page.
 #
-#   budget @ 0.5            11.25 GiB
-#     model weights          2.16
-#     activation/profiling   8.13   <- vLLM profiles the WORST CASE the config
-#     CUDA graph pool        0.45      allows: an encoder cache of max_model_len
-#   -> KV cache left         0.51      (8192) tokens at the maximum feature size
+# TRIED AND ABANDONED: deriving the fraction from free memory measured at run
+# time (take what nvidia-smi reports free, hold back a reserve, scale to that).
+# It looked right — one run measured 22.0 GiB free, derived 0.891, and got
+# 13.46 GiB of KV cache. The SAME derivation, on the SAME book, SAME page
+# range, with nvidia-smi again reporting 22.0 GiB free, then produced -0.92 GiB
+# and failed the same way. Fixed cost (everything vLLM needs before any KV
+# cache exists) measured 7.0 GiB on the successful run and 21.4 GiB on the
+# failed one — a 3x swing with no observable difference in the inputs. This
+# vLLM build does not print the "Memory profiling results" line that would
+# name which internal term varies, so the mechanism is unconfirmed — but
+# nvidia-smi's externally-visible "free" number evidently cannot predict it.
+# Do not resurrect free-memory derivation without that missing evidence.
 #
-# 0.51 GiB spare out of 22.5 is a 2% margin, and it is not stable: the log shows
-# the CUDA graph pool overrunning its own estimate by 58% (0.45 actual against
-# 0.19 predicted), a swing worth half of what remained. A book that failed and a
-# book that succeeded were not on opposite sides of a threshold; they were on
-# opposite sides of a coin flip.
+# WHAT IS PROVEN INSTEAD: Frankel completed a real book on 0.51 GiB of actual
+# KV cache. The parse does not need a large cache — it needs the fixed cost to
+# fit at all. So this is now a small FIXED ladder, not a derivation, with
+# real headroom below even the worst fixed cost observed so far (21.4 GiB out
+# of 23):
+GPU_MEM_UTIL_LADDER: "tuple[float, ...]" = (0.70, 0.55)
+
+# Lower rungs are not only more headroom — they plausibly lower the fixed cost
+# too. vLLM chooses how many CUDA-graph shapes to capture from the budget it is
+# given, so a smaller ask means a smaller graph pool, not just a smaller
+# request. This is consistent with Frankel's 0.50 run needing only 10.74 GiB
+# fixed cost against the failed Hartmann run's 21.4 at 0.891 — unconfirmed for
+# the same reason as above, but the direction of the retry is right either way.
 #
-# WHAT DOES NOT VARY: the 8.13 GiB. vLLM sizes it from max_model_len and the
-# config's maximum feature size, NOT from the pages of the document in front of
-# it. So this cannot be tuned per book, and batching smaller does not help —
-# both were plausible and both are wrong.
+# Retried only on the specific error vLLM raises for this condition — it names
+# the exact thing that went wrong, so retrying on it is a targeted response to
+# a known failure mode, not a blind "try again". Any other failure (a crash, a
+# stall) is not retried; the ladder is not a general fix for a bad run.
 #
-# WHAT DOES VARY: how much of the card is free. A different GPU, a second
-# process, or our own previous batch leaking on the way out all move it. So the
-# fraction is DERIVED at run time from measured free memory rather than fixed:
-# take what is actually free, hold back a reserve, express it as the fraction of
-# total that vLLM wants. On an idle L4 that lands near 0.91 and turns the 0.51
-# GiB of KV cache into roughly 9.5 GiB.
-#
-# Set --gpu-mem-util explicitly to override the derivation.
+# Explicit --gpu-mem-util skips the ladder and pins exactly that value, once,
+# with no fallback substitution — that is the point of overriding it.
 GPU_MEM_UTIL: "float | None" = None
 
-# Held back from vLLM: the CUDA context, allocator fragmentation, and the gap
-# between vLLM's CUDA-graph estimate and what it actually takes (0.26 GiB on the
-# one run we have measured). Two GiB is comfortably more than the observed
-# overrun, and costs nothing but KV cache we were not going to need.
-GPU_MEM_RESERVE_GIB = 2.0
-
-# Never hand over the whole card however much is free.
-GPU_MEM_UTIL_MAX = 0.95
-
-# What the engine consumes before any KV cache exists, measured on the L4:
-# 2.16 weights + 8.13 activation/profiling peak + 0.45 CUDA graphs. Model and
-# config are pinned, so this is a constant of the setup rather than of the run.
-GPU_ENGINE_FIXED_GIB = 10.75
-# A KV cache smaller than this runs, but with so little room for concurrent
-# sequences that throughput collapses — and it is one bad estimate away from
-# not starting at all. Frankel completed on 0.51 GiB, so this is not a hard
-# limit; it is the line below which we say so out loud.
-GPU_MIN_KV_GIB = 1.0
+# Before spending a subprocess launch on a rung, check whether the card
+# plainly cannot supply it: requesting more than nvidia-smi reports free right
+# now cannot succeed regardless of anything vLLM does internally, so there is
+# nothing to learn by trying. This is deliberately coarse — a floor, not a
+# prediction — because a precise prediction is exactly the approach that just
+# failed twice. A prior version of this check computed a precise-looking
+# projection, printed "TOO SMALL", and then ran the doomed attempt anyway,
+# burning 85 s to confirm what the projection already said. This one skips.
+GPU_MEM_SAFETY_MARGIN_GIB = 0.5
 
 # How much of each mineru output line to echo. This was 150, chosen to keep a
 # tqdm bar readable, and it silently cost a diagnosis: vLLM reports its memory
@@ -263,51 +263,6 @@ def _gpu_memory_gib() -> "tuple[float, float] | None":
         return total_mib / 1024, free_mib / 1024
     except Exception:
         return None
-
-
-def _derive_gpu_mem_util(explicit: "float | None") -> tuple[float, str]:
-    """Fraction of the card to give vLLM, from what is actually free right now.
-
-    Returns (fraction, explanation). The explanation is logged because this
-    number decides whether the engine starts at all, and a bare float in a log
-    is not enough to debug a failure six hours later.
-
-    Deriving beats a constant in the two cases a constant gets wrong: a card
-    that is not this card, and a card that is not empty. Both are ordinary —
-    someone else's GPU is a different size, and our own previous batch may not
-    have released cleanly when it crashed.
-    """
-    if explicit is not None:
-        # Skip the nvidia-smi call entirely — an explicit value is pinned
-        # regardless of what it would read, and this now runs once per job in
-        # a multi-batch container rather than once per container.
-        return explicit, f"explicit --gpu-mem-util {explicit}"
-    mem = _gpu_memory_gib()
-    if mem is None:
-        # No driver reading. Fall back to something workable on the GPUs this
-        # is actually run on rather than to MinerU's 0.5, which is the value
-        # that failed.
-        return 0.85, "nvidia-smi unreadable; falling back to 0.85"
-
-    total, free = mem
-    util = min((free - GPU_MEM_RESERVE_GIB) / total, GPU_MEM_UTIL_MAX)
-    why = (f"{free:.1f} GiB free of {total:.1f}, holding back "
-           f"{GPU_MEM_RESERVE_GIB:.1f} -> {util:.3f}")
-
-    # Judge the projected KV cache in GiB, not the fraction. A fraction cannot
-    # answer this: 0.55 of an A100 is 44 GiB and ample, 0.70 of an 8 GiB card is
-    # 5.5 GiB and cannot even hold the engine. Only the absolute remainder says
-    # whether this will start.
-    projected_kv = total * util - GPU_ENGINE_FIXED_GIB
-    why += f", projected KV cache {projected_kv:.1f} GiB"
-    if projected_kv < GPU_MIN_KV_GIB:
-        why += (f" — TOO SMALL. The engine takes ~{GPU_ENGINE_FIXED_GIB:.1f} GiB "
-                f"(weights + profiling peak) before caching anything, and "
-                f"{free:.1f} GiB free does not leave a workable remainder. "
-                f"Free the GPU or use a larger one; parsing fewer pages will "
-                f"not help, because the peak is sized from the config, not the "
-                f"document.")
-    return util, why
 
 
 def _telemetry() -> dict:
@@ -445,141 +400,195 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
         pdf_path = src_dir / job["name"]
         pdf_path.write_bytes(job["pdf"])
 
-        # Derived fresh for EVERY job, not once for the container. Measured
-        # this the expensive way: job 1 legitimately used ~20.5 GiB of a
-        # 22 GiB card; by the time job 2's subprocess started, the driver had
-        # not fully reclaimed it — 5.4 GiB was free, and job 2 got handed the
-        # stale fraction computed from job 1's headroom. "Every job here
-        # shares the same GPU" was true; "so the same fraction fits all of
-        # them" did not follow, and the two got conflated. An explicit
-        # override is still pinned across every job, since that is the user
-        # overriding the measurement on purpose.
-        job_util, job_why = _derive_gpu_mem_util(gpu_mem_util)
-        print(f"[kmc] {label} gpu-memory-utilization: {job_why}", flush=True)
-
-        cmd = ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "vlm-engine"]
-        if job.get("start") is not None and job.get("end") is not None:
-            cmd += ["-s", str(job["start"]), "-e", str(job["end"])]
-        # Unknown to mineru, forwarded verbatim to the vLLM server it starts.
-        # Must come last: everything after this point is passthrough.
-        cmd += ["--gpu-memory-utilization", str(job_util)]
-
         print(f"\n[kmc] === {label} ({i}/{len(jobs)}) ===", flush=True)
-        print(f"[kmc] {' '.join(cmd)}", flush=True)
-        t0 = time.perf_counter()
 
-        # Stream rather than capture: capture_output=True buffers until exit,
-        # which here means minutes of silence indistinguishable from a hang.
-        # A watchdog thread reads the clock while the main thread reads output —
-        # if output stops, the parse is stuck and the container is burning money
-        # for nothing, so kill it instead of waiting out the function timeout.
-        lines: list[str] = []
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-        )
-        assert proc.stdout is not None
+        def _attempt(cmd: list[str]) -> tuple[int, float, str, str]:
+            """Runs one mineru invocation to completion.
 
-        # Watching for *output* is not enough. A process can keep printing while
-        # the work behind it is wedged — a redrawing progress bar or a heartbeat
-        # log looks identical to progress from the outside. So the watchdog
-        # tracks the progress COUNTER (tqdm's "94/197") and requires it to
-        # advance. Chatty-but-frozen is the failure this catches; silence is
-        # only the easy case.
-        #
-        # Before any counter exists (vLLM init prints plenty and counts
-        # nothing), it falls back to time-since-output, which is the right
-        # measure for that phase.
-        lines: list[str] = []
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-        )
-        assert proc.stdout is not None
+            Returns (returncode, elapsed_s, combined_log, stall_reason). Pulled
+            out of the per-job body so the memory ladder below can call it once
+            per rung without duplicating the subprocess/watchdog machinery.
+            """
+            print(f"[kmc] {' '.join(cmd)}", flush=True)
+            t0 = time.perf_counter()
 
-        now = time.monotonic
-        last_output = [now()]
-        last_advance = [now()]
-        progress: list[tuple[int, int] | None] = [None]  # (done, total), None until seen
-        stalled = [""]
+            # Stream rather than capture: capture_output=True buffers until
+            # exit, which here means minutes of silence indistinguishable from
+            # a hang. A watchdog thread reads the clock while the main thread
+            # reads output — if output stops, the parse is stuck and the
+            # container is burning money for nothing, so kill it instead of
+            # waiting out the function timeout.
+            lines: list[str] = []
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            assert proc.stdout is not None
 
-        def watchdog() -> None:
-            beat = now()
-            while proc.poll() is None:
-                t = now()
-                tracking = progress[0] is not None
-                # Once a counter exists, frozen progress is the signal. Until
-                # then, silence is.
-                quiet = t - (last_advance[0] if tracking else last_output[0])
+            # Watching for *output* is not enough. A process can keep printing
+            # while the work behind it is wedged — a redrawing progress bar or
+            # a heartbeat log looks identical to progress from the outside. So
+            # the watchdog tracks the progress COUNTER (tqdm's "94/197") and
+            # requires it to advance. Chatty-but-frozen is the failure this
+            # catches; silence is only the easy case.
+            #
+            # Before any counter exists (vLLM init prints plenty and counts
+            # nothing), it falls back to time-since-output, which is the right
+            # measure for that phase.
+            now = time.monotonic
+            last_output = [now()]
+            last_advance = [now()]
+            progress: list[tuple[int, int] | None] = [None]  # None until seen
+            stalled = [""]
 
-                if t - beat >= 60:  # visibility while it is healthy
-                    beat = t
-                    where = f"progress {progress[0][0]}/{progress[0][1]}" if tracking else "starting up"
-                    print(
-                        f"[kmc] {label} alive — {where}, "
-                        f"{quiet:.0f}s since last advance (limit {stall_timeout_s}s)",
-                        flush=True,
-                    )
+            def watchdog() -> None:
+                beat = now()
+                while proc.poll() is None:
+                    t = now()
+                    tracking = progress[0] is not None
+                    # Once a counter exists, frozen progress is the signal.
+                    # Until then, silence is.
+                    quiet = t - (last_advance[0] if tracking else last_output[0])
 
-                if quiet > stall_timeout_s:
-                    stalled[0] = (
-                        f"progress frozen at {progress[0][0]}/{progress[0][1]}"
-                        if tracking else "no output"
-                    )
-                    print(
-                        f"[kmc] {label} STALLED — {stalled[0]} for {quiet:.0f}s "
-                        f"(limit {stall_timeout_s}s); killing",
-                        flush=True,
-                    )
-                    proc.kill()
-                    return
-                time.sleep(5)
+                    if t - beat >= 60:  # visibility while it is healthy
+                        beat = t
+                        where = (f"progress {progress[0][0]}/{progress[0][1]}"
+                                 if tracking else "starting up")
+                        print(
+                            f"[kmc] {label} alive — {where}, "
+                            f"{quiet:.0f}s since last advance (limit {stall_timeout_s}s)",
+                            flush=True,
+                        )
 
-        watch = threading.Thread(target=watchdog, daemon=True)
-        watch.start()
+                    if quiet > stall_timeout_s:
+                        stalled[0] = (
+                            f"progress frozen at {progress[0][0]}/{progress[0][1]}"
+                            if tracking else "no output"
+                        )
+                        print(
+                            f"[kmc] {label} STALLED — {stalled[0]} for {quiet:.0f}s "
+                            f"(limit {stall_timeout_s}s); killing",
+                            flush=True,
+                        )
+                        proc.kill()
+                        return
+                    time.sleep(5)
 
-        for line in proc.stdout:
-            last_output[0] = now()
-            lines.append(line)
-            # tqdm renders "<done>/<total>"; a change in either element counts
-            # as advancing, so moving between phases (layout -> content) is not
-            # mistaken for a stall.
-            m = _PROGRESS_RE.search(line)
-            if m:
-                state = (int(m.group(1)), int(m.group(2)))
-                if state != progress[0]:
-                    progress[0] = state
-                    last_advance[0] = now()
-            print(f"[mineru:{label}] {line.rstrip()[:LOG_LINE_CHARS]}", flush=True)
-        rc = proc.wait()
-        watch.join(timeout=10)
-        elapsed = time.perf_counter() - t0
-        log = "".join(lines)
-        if stalled[0]:
-            rc = rc or -1
-            log += f"\n[kmc] killed: {stalled[0]} for >{stall_timeout_s}s\n"
-        print(f"[kmc] {label} exited {rc} after {elapsed:.0f}s", flush=True)
+            watch = threading.Thread(target=watchdog, daemon=True)
+            watch.start()
+
+            for line in proc.stdout:
+                last_output[0] = now()
+                lines.append(line)
+                # tqdm renders "<done>/<total>"; a change in either element
+                # counts as advancing, so moving between phases (layout ->
+                # content) is not mistaken for a stall.
+                m = _PROGRESS_RE.search(line)
+                if m:
+                    state = (int(m.group(1)), int(m.group(2)))
+                    if state != progress[0]:
+                        progress[0] = state
+                        last_advance[0] = now()
+                print(f"[mineru:{label}] {line.rstrip()[:LOG_LINE_CHARS]}", flush=True)
+            rc = proc.wait()
+            watch.join(timeout=10)
+            elapsed = time.perf_counter() - t0
+            log = "".join(lines)
+            if stalled[0]:
+                rc = rc or -1
+                log += f"\n[kmc] killed: {stalled[0]} for >{stall_timeout_s}s\n"
+            print(f"[kmc] {label} exited {rc} after {elapsed:.0f}s", flush=True)
+            return rc, elapsed, log, stalled[0]
+
+        # An explicit value is used exactly once, with no fallback — that is
+        # the point of overriding it. Otherwise, step down the ladder.
+        candidates = ([gpu_mem_util] if gpu_mem_util is not None
+                      else list(GPU_MEM_UTIL_LADDER))
+
+        rc, elapsed, log, stall_reason = -1, 0.0, "", ""
+        total_elapsed = 0.0
+        used_util: "float | None" = None
+        used_why = ""
+        attempts_log: list[dict] = []
+
+        for rung, util in enumerate(candidates, 1):
+            source = (f"explicit --gpu-mem-util {util}" if gpu_mem_util is not None
+                      else f"ladder rung {rung}/{len(candidates)}: {util}")
+
+            # Do not spend a subprocess launch on a request the card plainly
+            # cannot supply — asking for more than is measured free right now
+            # cannot succeed no matter what vLLM does internally, so there is
+            # nothing to learn by trying. This check is deliberately coarse
+            # (a floor, not a projection): a precise-looking projection is
+            # exactly what failed twice already tonight.
+            mem = _gpu_memory_gib()
+            if mem is not None:
+                total, free = mem
+                needed = util * total
+                if needed > free - GPU_MEM_SAFETY_MARGIN_GIB:
+                    used_why = (f"{source} needs ~{needed:.1f} GiB but only "
+                                f"{free:.1f} GiB is free (of {total:.1f}) — "
+                                f"skipped, mineru was not launched")
+                    print(f"[kmc] {label} {used_why}", flush=True)
+                    attempts_log.append({"util": util, "skipped": True})
+                    used_util = util
+                    continue
+
+            print(f"[kmc] {label} gpu-memory-utilization: {source}", flush=True)
+            # Start from an empty directory on every attempt: a rung that
+            # failed at engine init should not leave anything behind for the
+            # next rung to trip over, even though mineru fails before writing
+            # page output this early.
+            shutil.rmtree(out_dir, ignore_errors=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            cmd = ["mineru", "-p", str(pdf_path), "-o", str(out_dir), "-b", "vlm-engine"]
+            if job.get("start") is not None and job.get("end") is not None:
+                cmd += ["-s", str(job["start"]), "-e", str(job["end"])]
+            # Unknown to mineru, forwarded verbatim to the vLLM server it
+            # starts. Must come last: everything after this point is
+            # passthrough.
+            cmd += ["--gpu-memory-utilization", str(util)]
+
+            rc, elapsed, log, stall_reason = _attempt(cmd)
+            total_elapsed += elapsed
+            used_util, used_why = util, source
+            attempts_log.append({
+                "util": util, "skipped": False, "returncode": rc,
+                "elapsed_s": round(elapsed, 1),
+            })
+
+            if rc == 0:
+                break
+
+            # Retried only on the specific condition vLLM names — it is a
+            # targeted response to a known failure mode, not a blind retry.
+            # A stall, a crash, anything else: stop here, this job failed.
+            no_kv_room = "No available memory for the cache blocks" in log
+            if no_kv_room and rung < len(candidates):
+                print(f"[kmc] {label} rung {rung}/{len(candidates)} had no room "
+                      f"for a KV cache; trying the next rung", flush=True)
+                continue
+            break
 
         # vLLM reports this as a knob to turn, which sends you looking for a
         # setting when the real question is what else is holding the card. Say
-        # what was actually available, since we measured it.
+        # what was actually available, and what was already tried.
         if rc != 0 and "No available memory for the cache blocks" in log:
             mem = _gpu_memory_gib()
-            # NOT `now` — that name is bound to time.monotonic in this function
-            # and the watchdog closes over it, so rebinding it here would leave
-            # the next job's watchdog calling a string.
             free_now = (f"{mem[1]:.1f} GiB free of {mem[0]:.1f} right now"
                         if mem else "GPU memory unreadable")
+            tried = ", ".join(str(a["util"]) for a in attempts_log if not a["skipped"])
             print(
-                f"[kmc] {label} DIAGNOSIS: vLLM had no room for a KV cache.\n"
-                f"[kmc]   ran at --gpu-memory-utilization {job_util:.3f} ({job_why})\n"
-                f"[kmc]   {free_now} — that is what it actually got, measured\n"
-                f"[kmc]   fresh for this job, so this is not the stale-derivation\n"
-                f"[kmc]   bug (fixed): the card had less free right now than the\n"
-                f"[kmc]   fraction above assumed. The GPU_MEM_RESERVE_GIB headroom\n"
-                f"[kmc]   was not enough this time, most likely because a job\n"
-                f"[kmc]   earlier in this container has not fully released its\n"
-                f"[kmc]   memory back to the driver yet. Re-running resumes from\n"
-                f"[kmc]   completed batches; if it recurs, raise the reserve or\n"
-                f"[kmc]   move this job to its own container.",
+                f"[kmc] {label} DIAGNOSIS: vLLM never found room for a KV cache.\n"
+                f"[kmc]   tried: {tried or '(nothing — skipped by the free-memory check)'}\n"
+                f"[kmc]   {free_now}\n"
+                f"[kmc]   This is the fixed-cost variance on record: the same book at\n"
+                f"[kmc]   the same utilization has measured anywhere from 7 to 21 GiB\n"
+                f"[kmc]   of cost before any KV cache exists, with no observed\n"
+                f"[kmc]   difference in the inputs — see modal-cost-model. Re-running\n"
+                f"[kmc]   resumes from completed batches. If every rung keeps failing,\n"
+                f"[kmc]   this GPU class may not reliably fit the engine at all.",
                 flush=True,
             )
 
@@ -589,10 +598,11 @@ def parse_jobs(jobs: list[dict], stall_timeout_s: int = STALL_TIMEOUT_S,
             "start": job.get("start"),
             "end": job.get("end"),
             "returncode": rc,
-            "stalled": stalled[0],
-            "elapsed_s": round(elapsed, 1),
-            "gpu_mem_util": job_util,
-            "gpu_mem_util_why": job_why,
+            "stalled": stall_reason,
+            "elapsed_s": round(total_elapsed, 1),
+            "gpu_mem_util": used_util,
+            "gpu_mem_util_why": used_why,
+            "gpu_mem_attempts": attempts_log,
             "log_tail": log[-3000:],
             "tar": None,
         }
