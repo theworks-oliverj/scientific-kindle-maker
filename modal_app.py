@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 """
 Modal remote parse — run MinerU's GPU work off-box and bring middle.json home.
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 """
 Stage 10 — EPUB3 Assembly
 Assembles the processed document into a valid EPUB3 file.

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 """
 CLI entry point for the Kindle Math Converter.
 

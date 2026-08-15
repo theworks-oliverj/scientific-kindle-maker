@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 """
 Generates a self-contained HTML report after pipeline completion.
 """
