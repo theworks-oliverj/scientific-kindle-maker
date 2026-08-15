@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 """
 Stage 9 — SVG Post-Processing for Kindle
 Applies all known Kindle/KDP rendering bug mitigations to each SVG.

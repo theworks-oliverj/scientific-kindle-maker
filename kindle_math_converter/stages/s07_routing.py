@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 """
 Stage 7 — Confidence Routing
 Purely a partition: splits equations into pass_list and fallback_list

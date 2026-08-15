@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 """
 Stage 2B — Visual/Scanned PDF Extraction
 Rasterizes each page to 300 DPI grayscale PNG. All downstream stages

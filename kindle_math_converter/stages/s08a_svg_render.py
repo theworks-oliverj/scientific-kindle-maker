@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 """
 Stage 8A — SVG Rendering
 Renders validated equations to SVG via tectonic + dvisvgm.

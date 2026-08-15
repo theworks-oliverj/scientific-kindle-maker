@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable

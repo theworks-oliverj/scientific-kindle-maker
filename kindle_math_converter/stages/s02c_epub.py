@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Oliver Jandette
+
 """
 Stage 2C — EPUB/HTML Parse
 Uses ebooklib to unpack the EPUB. Parses each XHTML document in spine order.

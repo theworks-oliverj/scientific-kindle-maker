@@ -3,23 +3,121 @@
 Converts academic PDFs and EPUBs into Kindle-compatible EPUB3 files with
 correctly rendered mathematical equations as scalable vector graphics (SVG).
 
+License: [AGPL-3.0](LICENSE) — see
+[License and third-party components](#10-license-and-third-party-components).
+
 ---
 
 ## Table of Contents
 
+- [Architecture at a glance](#architecture-at-a-glance) — diagram, what makes
+  this different from MinerU alone, and the local/remote split
 0. [Quick start](#0-quick-start) — **start here for a normal book run**
 1. [How it works — the short version](#1-how-it-works--the-short-version)
 2. [System requirements](#2-system-requirements)
+   - [Platform variations (non-Apple-Silicon hardware)](#2b-platform-variations-non-apple-silicon-hardware)
 3. [Installation](#3-installation)
 4. [Usage](#4-usage)
    - [Long documents (100+ pages)](#4b-long-documents-100-pages)
    - [Running the parse on a GPU](#running-the-parse-on-a-gpu)
    - [Verifying a parser change](#verifying-a-parser-change)
+   - [Performance expectations by page count](#4c-performance-expectations-by-page-count)
 5. [Understanding the output files](#5-understanding-the-output-files)
 6. [Configuration reference](#6-configuration-reference)
+   - [The tectonic LaTeX engine — what scientific users should expect](#the-tectonic-latex-engine--what-scientific-users-should-expect)
+   - [Accuracy and reliability — what to expect](#accuracy-and-reliability--what-to-expect)
 7. [The pipeline — what happens inside](#7-the-pipeline--what-happens-inside)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Known limitations](#9-known-limitations)
+10. [License and third-party components](#10-license-and-third-party-components)
+
+---
+
+## Architecture at a glance
+
+```mermaid
+flowchart TD
+    IN["Input file (.pdf / .epub)"]
+
+    subgraph LOCAL["ALWAYS LOCAL — CPU only, runs on your machine"]
+        S1["s01 — Classifier<br/>PDF vs scanned vs EPUB, encrypted/empty checks"]
+        S2B["s02b — Rasterize @300dpi<br/>(ALL PDFs, born-digital included)"]
+        S2C["s02c — Parse MathML + HTML"]
+        S5C["s05c — MathML → LaTeX<br/>(no model involved)"]
+        S6["s06 — Validate + Repair<br/>compile with tectonic, score plausibility,<br/>heuristic repair + recompile"]
+        S7["s07 — Route<br/>PASS/REPAIR vs FALLBACK"]
+        S8A["s08a — SVG render<br/>tectonic (DVI) + dvisvgm --no-fonts"]
+        S8B["s08b — Fallback<br/>Mathpix API, or raster crop of the source"]
+        S9["s09 — SVG post-process<br/>font-size strip, pt→em, currentColor,<br/>per-region glyph-id namespacing"]
+        S10["s10 — EPUB assembly<br/>single reading-order stream, chapters split<br/>at 250KB, footnotes/links, epubcheck (fatal)"]
+        S11["s11 — Output<br/>.epub + HTML report + JSON + log"]
+    end
+
+    subgraph REMOTE["OPTIONAL — rented GPU (Modal), billed per second"]
+        S3["s03 — MinerU vision-language parse<br/>layout + reading order + text + equations<br/>in page batches, written to a Modal Volume"]
+    end
+
+    IN --> S1
+    S1 -->|PDF| S2B
+    S1 -->|EPUB/HTML| S2C
+    S2B --> S3
+    S3 -->|"middle.json per batch,<br/>same directory layout local expects"| S6
+    S2C --> S5C --> S6
+    S6 --> S7
+    S7 -->|pass/repair| S8A
+    S7 -->|fallback| S8B
+    S8A -->|render failed| S8B
+    S8A --> S9
+    S8B --> S9
+    S9 --> S10 --> S11
+```
+
+**`s03` is the only stage that ever runs remotely, and only if you choose to
+run it on Modal** — the `REMOTE` box above is the sole thing that moves; every
+other stage, including the classifier and rasterizer that feed it, always
+runs on your machine. If the parse is run locally instead (no `modal_app.py`
+involved), `s03` runs inside the `LOCAL` box too — it's the same code either
+way, just invoked from a different place; see
+[Running the parse on a GPU](#running-the-parse-on-a-gpu). Everything except
+`s03` never touches a GPU: tectonic, dvisvgm, poppler and epubcheck are CPU
+subprocesses regardless of where the parse happened.
+
+**What this adds on top of MinerU (or any layout-parser) alone.** MinerU
+recovers layout and recognises equations as LaTeX, but stops there — it does
+not know whether that LaTeX is *right*, and it has no opinion on Kindle's
+rendering quirks. This project exists for what happens after MinerU's output:
+
+- **A correctness gate MinerU doesn't have.** Every equation is compiled with
+  a real LaTeX engine and scored for plausibility (Stage 6); wrong-but-close
+  recognition gets a repair pass, and anything still broken falls back to a
+  crop of the source rather than shipping broken or invisible math.
+- **Equations rendered as scalable vector graphics, inline in the sentence**,
+  not as images or raw LaTeX text — most PDF→EPUB tools do one of those two.
+  SVGs scale with the reader's font size and respect Kindle's dark mode
+  (Stage 9); a raster image doesn't do either.
+- **Kindle-specific fixes no general-purpose EPUB tool applies**: the
+  `dvisvgm --no-fonts` flag working around a font-corruption bug in KDP's
+  conversion, per-equation glyph-id namespacing (duplicate SVG glyph ids fail
+  KDP review), and a 250 KB hard split per chapter file (Kindle silently
+  drops anything larger).
+- **A regression harness for the parser itself** (`compare-snapshots`) that
+  two speed optimizations already failed — see
+  [Verifying a parser change](#verifying-a-parser-change).
+
+**Configuration you need to have decided before running a book**, in the
+order they matter:
+
+1. Does the target machine have a usable GPU for MinerU? (Apple Silicon or an
+   NVIDIA card — see [System requirements](#2-system-requirements)). If not,
+   plan on the Modal remote parse.
+2. If running remotely, has `modal setup` been done, and what
+   `--batch-pages` will you use? That number **must** match
+   `--parse-batch-size` on the local step — see
+   [Running the parse on a GPU](#running-the-parse-on-a-gpu).
+3. Is a Mathpix key available for equations that fail local recognition, or
+   should those just fall back to a raster crop?
+4. What body font size does the source document use (`--font-size`), so
+   equation SVGs scale correctly against it?
 
 ---
 
@@ -63,9 +161,16 @@ prints the exact step 2 command; copy that rather than retyping it.
 
 ### Five things worth knowing
 
-- **Re-running is cheap.** Completed batches and successful LaTeX compiles are
-  cached under the output directory, so a second run skips both. If a remote
-  batch failed, just run step 1 again — it fills in only what is missing.
+- **Re-running the local build (step 2) is cheap.** Completed batches and
+  successful LaTeX compiles are cached under the output directory, so a second
+  run skips both.
+- **Re-running the remote parse (step 1) is not free of re-billing.** If a
+  batch failed, running step 1 again does re-parse every batch on the GPU,
+  including ones that already succeeded — there is no check against what's
+  already on the Modal Volume before that. It fills in what's missing
+  correctly, it just also re-pays for what wasn't missing. On a two-batch book
+  where one batch failed, expect to pay for both batches again, not just the
+  one that failed.
 - **Confirm the parse was reused.** Step 2 should log `mineru_batch_reused`
   within its first seconds. If it logs `mineru_batch_start` instead, it is
   parsing locally — stop it and check the batch size matches.
@@ -105,7 +210,9 @@ This tool does four things differently:
 
 - **Python 3.10 or later.**
 - **~5 GB free disk space** for model weights and tools.
-- **Internet connection** for the first run (to download models).
+- **Internet connection** for the first run — both to download MinerU's model
+  and for tectonic's own one-time font/package bundle download; see
+  [The tectonic LaTeX engine](#the-tectonic-latex-engine--what-scientific-users-should-expect).
 - **A GPU, effectively.** Details below — this is the requirement that decides
   whether the tool is usable on a given machine.
 
@@ -146,6 +253,54 @@ check which engine was selected before looking anywhere else.
 
 The rest of the pipeline needs no GPU. tectonic, dvisvgm, poppler and epubcheck
 are all CPU subprocesses.
+
+### 2b. Platform variations (non-Apple-Silicon hardware)
+
+The project is developed and measured on Apple Silicon; everything else below
+is what's known to differ, not a full port checklist. Everything downstream of
+the MinerU parse (Stages 5C–11: compiling, SVG rendering, EPUB assembly,
+epubcheck) is plain CPU Python and subprocess calls, and needs nothing
+platform-specific beyond the binaries in [Installation](#3-installation).
+
+**Linux with an NVIDIA GPU (CUDA), compute capability ≥ 8.0**
+- Install the `mineru[vlm,vllm]` extra instead of `mlx` (the requirements file
+  selects this automatically by `sys_platform`).
+- **Use `uv`, not `pip`**, to install `kindle_math_converter/requirements.txt`
+  — pip cannot resolve the `vllm` branch of MinerU's dependency tree and
+  backtracks indefinitely. See [Installation](#3-installation).
+- Homebrew's `brew install tectonic dvisvgm poppler` doesn't apply. Install
+  [tectonic](https://tectonic-typesetting.github.io/en-US/install.html)
+  directly, and `apt install dvisvgm poppler-utils epubcheck` (or your
+  distro's equivalent) for the rest.
+- **Recognition output differs from the Mac path and is not run-to-run
+  reproducible** — vLLM's batched execution reorders floating-point
+  reductions between runs. This is a property of the CUDA path itself, not a
+  configuration issue; see
+  [Local runs are reproducible; GPU runs are not](#local-runs-are-reproducible-gpu-runs-are-not).
+- `modal-requirements.txt` in the repo root is the fully-pinned, most-tested
+  Linux x86_64 dependency set — it's what the Modal GPU image itself is built
+  from — and is a safe fallback if the plain `requirements.txt` resolution
+  gives trouble.
+- **Never use a T4** for the parse, on Modal or otherwise: its compute
+  capability (7.5) is below the 8.0 threshold at which MinerU enables custom
+  logits processors, so it silently takes a different, unverified code path.
+
+**Intel Mac, or any machine without a usable GPU**
+- The local parse is not viable — MinerU's CPU fallback (`transformers`) has
+  never been benchmarked in this project but was scoped at 38–126 CPU-hours
+  per 1000 pages. Treat it as "does not work."
+- Everything else in this project (tectonic, dvisvgm, poppler, epubcheck, the
+  Python pipeline itself) is architecture-agnostic and installs the same way
+  as on Apple Silicon.
+- Rent the parse instead — see
+  [Running the parse on a GPU](#running-the-parse-on-a-gpu). The local machine
+  only needs the CPU-side toolchain; it never runs MinerU itself.
+
+**Windows** — not tested, and nothing in this project has been adapted for
+it. The installation steps assume Homebrew (macOS) or apt (Linux); a native
+Windows install would need PowerShell equivalents for the binary installs and
+is unverified. WSL2 with an NVIDIA GPU should behave like the Linux/CUDA path
+above, but this has not been run or measured here.
 
 ---
 
@@ -290,7 +445,7 @@ python main.py convert paper.pdf --open-report
 # Lower the quality threshold (accept more equations as-is, fewer flagged)
 python main.py convert paper.pdf --cdm-threshold 0.80
 
-# Use a different body font size for SVG scaling (default is 10pt)
+# Use a different body font size for SVG scaling (default is 12pt)
 python main.py convert paper.pdf --font-size 11.0
 
 # Skip epubcheck (if Java is not installed)
@@ -315,6 +470,8 @@ Options:
   --fresh-parse               Re-run MinerU even if a cached parse exists.
   --max-parallel-workers INT  Threads for per-equation work. [default: min(8, cpus)]
   --parse-batch-size INT      Pages per MinerU invocation.   [default: 50]
+  --no-image-analysis         Skip MinerU's per-figure description pass
+                               (loses figure alt text; no measured speed gain).
   --mineru-timeout INT        Per-batch timeout in seconds.  [default: derived]
 ```
 
@@ -463,8 +620,13 @@ file with itself and report "identical" forever. Use `--layout labelled` for
 those, which writes one directory per job and expects you to place the results
 yourself.
 
-Failed batches are not fatal. Each one commits to a Modal Volume as it finishes,
-so re-running the same command fills in only what is missing.
+Failed batches are not fatal in the sense that a re-run will eventually produce
+a complete parse — but the remote runner does not currently check the Modal
+Volume before re-invoking `mineru` on a batch that already succeeded there. A
+retry re-parses (and re-bills) every batch in the command, not just the one
+that failed. The fix — skip a batch whose result is already committed to the
+Volume — is designed but not yet built; the local step (`s03`) does have this
+resumability, which is why step 2 stays cheap to re-run.
 
 ### How much GPU memory the engine gets
 
@@ -747,13 +909,20 @@ Running the same document twice locally produces identical output. The Apple
 Silicon path (`mlx-engine`) predicts one region at a time, and MinerU requests
 greedy decoding (`temperature=0.0, top_k=1`), so the result is deterministic.
 
-**A CUDA GPU running `vllm-engine` is not deterministic.** Measured on the same
-PDF, same pinned package set, same model, two consecutive runs: **2 of 153
-equations differed.** This is not a sampling setting that can be corrected —
-MinerU already requests greedy decoding on every backend. It is a property of
-vLLM's batched execution: batch composition changes the order of floating-point
-reductions, so identical greedy requests can resolve to different tokens
-depending on how the scheduler grouped them.
+**A CUDA GPU running `vllm-engine` is not deterministic — and this isn't only
+about equation content.** Measured on the same PDF, same pinned package set,
+same model, in the same container, two consecutive runs: **152 equations
+detected on one run, 153 on the other, with 2 changed.** The count itself
+moved, not just the recognised LaTeX for a fixed set of equations — meaning
+MinerU's page-region partitioning is itself part of what's non-deterministic
+on this backend, not only the token-level recognition inside an already-fixed
+region. This is not a sampling setting that can be corrected — MinerU already
+requests greedy decoding on every backend (`temperature=0.0, top_k=1`,
+confirmed in `mineru_vl_utils`). It is a property of vLLM's batched execution:
+batch composition changes the order of floating-point reductions, so
+identical greedy requests can resolve to different tokens — and, downstream
+of that, different region boundaries — depending on how the scheduler grouped
+them.
 
 Practical consequences:
 
@@ -765,6 +934,42 @@ Practical consequences:
   small diffs as inconclusive rather than as a regression.
 
 Design around it rather than trying to fix it.
+
+### 4c. Performance expectations by page count
+
+Two numbers dominate everything else: the MinerU parse (~95% of a long run's
+wall clock) and, downstream of it, equation compiling at roughly 0.6 s per
+equation reaching tectonic. The table below is the parse alone, local vs.
+remote, at the measured reference rates elsewhere in this document
+(**45 s/page** local on an M4's GPU; **~3.5 s/page** remote on Modal's default
+L4 + 8 cores + 16 GiB, which includes vLLM's ~70–145 s per-invocation init
+cost amortised over the batch).
+
+| Pages | Local parse only (Apple Silicon GPU) | Remote parse only (Modal, L4+8+16) | Remote cost |
+|---|---|---|---|
+| 6 (short paper) | *whole pipeline ~5 min, measured — parse dominates but isn't isolated at this size* | not worth renting — see below | — |
+| 100 | ~75 min | ~7 min | ~$0.15 |
+| 250 | ~3.1 hr | ~16 min | ~$0.35 |
+| 500 | ~6.25 hr | ~32 min *(measured)* | ~$0.70 *(measured)* |
+| 1000 | ~12.5 hr | ~63 min *(measured)* | ~$1.35 *(measured)* |
+
+*100/250-page figures are derived from the 3.5 s/page rate this project uses
+for per-book cost planning, plus the measured per-invocation init overhead
+(~19% on a 100-page batch, ~7% on a 250-page batch); the 500/1000-page rows
+are measured end to end. Note this project's own dedicated 8-core/16GiB
+throughput measurement came in higher, at 4.1 s/page — so treat the 100/250
+rows as ~15% optimistic against that stricter number, not as a bound. Costs
+use the rate card in
+[Working out what a GPU run costs](#working-out-what-a-gpu-run-costs) and are
+stale if Modal's pricing has moved — re-check <https://modal.com/pricing>.*
+
+**Rule of thumb:** under ~50 pages, local parsing is usually faster once you
+count uploading the PDF and the ~70–145 s Modal container/engine startup; for
+anything past a hundred pages or so, renting the GPU is both faster in wall
+clock and, per the numbers above, inexpensive. Equation compiling and SVG
+rendering (everything after the parse) run at the same speed either way,
+since they're always local CPU work — add roughly a few minutes for a
+few-hundred-equation book, more for equation-dense textbooks.
 
 ---
 
@@ -872,6 +1077,79 @@ python main.py download-models
 To point MinerU at a *different* model (a quantized build, say), set
 `MINERU_MODEL_SOURCE=local` and add `models-dir.vlm` to `~/mineru.json`. Back
 that file up first — MinerU rewrites it.
+
+### The tectonic LaTeX engine — what scientific users should expect
+
+Every equation is compiled by [tectonic](https://tectonic-typesetting.github.io/),
+a self-contained TeX engine — not a full TeX Live install, and not the
+document's original LaTeX preamble. Each equation is wrapped standalone in its
+own minimal document before compiling, so what your source PDF's preamble
+does (custom macros, `\newcommand`, unusual packages) is invisible to it. Two
+consequences worth setting expectations around:
+
+- **A fixed, small package set**, not your document's own preamble:
+  `amsmath`, `amssymb`, `amsfonts`, `physics`, plus `braket` auto-added when
+  `\bra`/`\ket`/`\braket` is detected in the equation. Equations built from
+  these — which covers the overwhelming majority of physics, math and
+  engineering notation — compile cleanly. An equation that depends on a macro
+  defined only in the source document's own preamble (a custom operator, a
+  redefined symbol) will not resolve and falls through the quality gate to a
+  raster crop of the original — not silently dropped, just not vector.
+- **Font encoding is deliberately forced to Computer Modern via `[OT1]{fontenc}`**,
+  not tectonic's default (Latin Modern). Latin Modern ships only as `.otf` in
+  tectonic's bundle, which `dvisvgm` cannot embed — every equation containing
+  `\text{...}` failed until this was fixed. The tradeoff: OT1 has no non-ASCII
+  glyphs, so non-ASCII characters inside `\text{}` (e.g. accented author names
+  in a caption-style equation) can still fail to render and fall back to a
+  raster crop.
+
+**tectonic has its own first-run download, separate from the MinerU model.**
+It fetches its font/package bundle on first use and caches it under
+`~/Library/Caches/Tectonic` (macOS) or `~/.cache/Tectonic` (Linux) —
+automatic, and only once. This is a second reason the "internet connection
+for the first run" requirement in [System requirements](#2-system-requirements)
+applies: it isn't only the MinerU model download.
+
+**Rendering, not typesetting fidelity, is the target.** The pipeline uses
+tectonic's compile step as a *correctness check* (does this LaTeX compile,
+does it look plausible) and its SVG output as the *artifact* — it is not
+attempting to reproduce the source document's exact typographic choices
+(different math font packages, custom operator spacing). If a book's
+equations rely on packages outside `amsmath`/`amssymb`/`amsfonts`/`physics`/`braket`,
+expect more equations in the flagged/fallback tier — see
+[Known limitations](#9-known-limitations).
+
+### Accuracy and reliability — what to expect
+
+Two things are worth setting expectations on before trusting output for real
+scientific reading, neither of which is a bug in this pipeline — they're
+properties of the technology it's built on.
+
+**Some equations will be recognised wrong, and the pipeline cannot always
+tell.** The quality gate is *"does this LaTeX compile, and does its shape
+look plausible against the source crop"* — never a direct visual comparison
+against the original equation. An equation recognised incorrectly but that
+still happens to compile and look plausible **passes silently**. Measured
+against ground truth on a real corpus, both the local (`mlx-engine`) and
+remote (`vllm-engine`) MinerU backends sit near **98.7% accuracy**, with
+partially non-overlapping error sets — remote is a peer, not a downgrade,
+but neither is exact. On a thousand-equation book, that's on the order of a
+dozen quiet errors. `compare-snapshots` catches *changes* in recognition
+between two runs; it does not catch *errors* present in both. See
+[Known limitations](#9-known-limitations) for the accepted-gap writeup.
+
+**Don't expect byte-for-byte reproducibility from any GPU-backed parse —
+local Apple Silicon is the only deterministic path.** Both a rented Modal GPU
+and a local Linux/CUDA machine run MinerU's `vllm-engine`, and vLLM's batched
+execution reorders floating-point reductions between runs regardless of where
+it's hosted. This isn't limited to a few tokens changing inside an otherwise
+fixed set of equations — one measured pair of consecutive runs on the same
+PDF, same container, same everything, found the *equation count itself*
+moved (152 → 153), meaning MinerU's page-region partitioning is part of what
+varies, not only the LaTeX recognised inside an already-agreed-upon region.
+See [Local runs are reproducible; GPU runs are not](#local-runs-are-reproducible-gpu-runs-are-not)
+for the full measurement and what it means for snapshot comparisons and for
+reproducing someone else's exact output.
 
 ---
 
@@ -1225,3 +1503,47 @@ before converting.
 
 **Scanned PDFs with skew > 5°** — the deskew step handles minor rotation but
 heavily skewed scans will produce poor detection results.
+
+---
+
+## 10. License and third-party components
+
+This project is licensed under the **GNU Affero General Public License v3.0
+(AGPL-3.0)** — see [`LICENSE`](LICENSE). In short: you're free to use, modify
+and redistribute it, including commercially, but if you distribute a modified
+version or run it as a network service, you must make the source of your
+version available to the people you're distributing to or serving, under the
+same license. The intent is that this stays a shared tool — if you build on
+it, that has to stay available for others to build on too, not get closed up
+and resold.
+
+**Why AGPL-3.0 specifically:** two core dependencies —
+[PyMuPDF](https://github.com/pymupdf/PyMuPDF) (page rasterization) and
+[EbookLib](https://github.com/aerkalov/ebooklib) (EPUB assembly) — are
+themselves licensed AGPL-3.0 and imported directly into this project's code,
+not run as separate subprocesses. That makes the combined work AGPL by
+construction; this project's own license simply matches what its dependencies
+already require.
+
+**What else runs under the hood, and under what license** — useful if you're
+assessing this project for your own use, since several tools are invoked as
+subprocess binaries you install separately rather than bundled here:
+
+| Component | License | How it's used here |
+|---|---|---|
+| [MinerU](https://github.com/opendatalab/MinerU) | Apache 2.0 + additional terms (commercial-use threshold at 100M MAU / $20M monthly revenue — not relevant at this project's scale) | Invoked as a CLI subprocess |
+| [PyMuPDF](https://github.com/pymupdf/PyMuPDF) | AGPL-3.0 (commercial license available from Artifex) | Imported directly (page rasterization, page counting) |
+| [EbookLib](https://github.com/aerkalov/ebooklib) | AGPL-3.0 | Imported directly (EPUB assembly) |
+| [tectonic](https://github.com/tectonic-typesetting/tectonic) | MIT | Installed separately (Homebrew/etc.), invoked as a subprocess |
+| [dvisvgm](https://github.com/mgieseki/dvisvgm) | GPL-3.0 | Installed separately, invoked as a subprocess |
+| [poppler](https://poppler.freedesktop.org/) | GPL-2.0/GPL-3.0 | Installed separately (via `pdf2image`), invoked as a subprocess |
+| [epubcheck](https://github.com/w3c/epubcheck) | BSD-3-Clause | Installed separately (Java jar), invoked as a subprocess |
+| numpy, lxml, Pillow, click, rich, jinja2, structlog, requests, scikit-image, pdf2image, opencv-contrib-python | BSD / MIT / Apache-2.0 / HPND (all permissive) | Imported directly |
+| cairosvg (optional) | LGPL-2.1+ | Imported directly, behind a try/except — the HTML report renders without it |
+
+This table reflects the licenses of these projects as checked in 2026-08; a
+dependency's license can change between its releases, so re-verify before
+relying on it for your own compliance decisions. This project does not
+redistribute tectonic, dvisvgm, poppler or epubcheck — you install them
+yourself per [Installation](#3-installation) — so their own license terms
+govern your use of those binaries directly, not this project's license.
