@@ -43,24 +43,46 @@ jobs:
       - name: Debug dvisvgm render
         run: |
           ldconfig -p | grep -i libgs || echo "no libgs in ldconfig cache"
-          dpkg -L ghostscript | grep libgs || echo "no libgs in ghostscript package"
           python - <<'PY'
+          import subprocess
           import tempfile
           from pathlib import Path
-          from kindle_math_converter.stages.s08a_svg_render import latex_to_xdv, xdv_to_svg, _dvisvgm_env
+          from kindle_math_converter.stages.s08a_svg_render import latex_to_xdv, _dvisvgm_env, _find_binary
           from kindle_math_converter.models.enums import FormulaClass
-
-          env = _dvisvgm_env()
-          print("LIBGS =", env.get("LIBGS"))
-          print("TEXFONTS =", env.get("TEXFONTS"))
 
           with tempfile.TemporaryDirectory() as tmpdir:
               work = Path(tmpdir)
               xdv = latex_to_xdv("E=mc^2", FormulaClass.INLINE, work, timeout=30)
               print("xdv ok:", xdv, xdv.stat().st_size, "bytes")
-              svg = xdv_to_svg(xdv, work, timeout=30)
-              print("svg ok, length", len(svg))
-              print(svg[:800])
+
+              print("--- Tectonic cache tree, now that a compile has happened ---")
+              cache = Path.home() / ".cache" / "Tectonic"
+              for p in sorted(cache.rglob("*"))[:200]:
+                  print(p)
+
+              print("--- font file extensions under cache ---")
+              exts = {}
+              for p in cache.rglob("*"):
+                  if p.is_file():
+                      exts[p.suffix] = exts.get(p.suffix, 0) + 1
+              for ext, count in sorted(exts.items(), key=lambda kv: -kv[1]):
+                  print(ext or "(no ext)", count)
+
+              env = _dvisvgm_env()
+              print("LIBGS =", env.get("LIBGS"))
+              print("TEXFONTS =", env.get("TEXFONTS"))
+
+              svg_path = work / "equation.svg"
+              result = subprocess.run(
+                  [_find_binary("dvisvgm"), "--no-fonts", "--exact-bbox", "--precision=4",
+                   "--bbox=min", f"--output={svg_path}", str(xdv)],
+                  capture_output=True, timeout=30, cwd=work, env=env,
+              )
+              print("dvisvgm returncode:", result.returncode)
+              print("dvisvgm stdout:", result.stdout.decode(errors="replace"))
+              print("dvisvgm stderr:", result.stderr.decode(errors="replace"))
+              print("svg content:")
+              print(svg_path.read_text() if svg_path.exists() else "(no file produced)")
           PY
 
       # epubcheck (Java) is deliberately not installed here: the fast test
