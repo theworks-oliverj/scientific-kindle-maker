@@ -16,8 +16,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install system dependencies (dvisvgm, poppler)
-        run: sudo apt-get update && sudo apt-get install -y dvisvgm poppler-utils
+      # ghostscript provides libgs.so.9, which dvisvgm needs (via LIBGS, see
+      # _dvisvgm_env() in s08a_svg_render.py) to trace Type1/OTF glyphs to
+      # paths. Without it, --no-fonts renders produce <use> refs to glyphs
+      # that were never defined — caught deliberately as an orphaned-glyph
+      # render failure rather than shipping a blank equation.
+      - name: Install system dependencies (dvisvgm, ghostscript, poppler)
+        run: sudo apt-get update && sudo apt-get install -y dvisvgm ghostscript poppler-utils
 
       # tectonic isn't packaged for Ubuntu's apt; install the pinned release
       # binary directly rather than piping the upstream install script to sh.
