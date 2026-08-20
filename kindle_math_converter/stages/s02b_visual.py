@@ -45,7 +45,10 @@ def _deskew_image(img):
 
     angles = []
     for line in lines:
-        x1, y1, x2, y2 = line[0]
+        # HoughLinesP's per-line shape varies across OpenCV builds/versions
+        # — usually (1, 4), sometimes flattened to (4,) — so normalize
+        # before unpacking instead of assuming line[0] is the 4-tuple.
+        x1, y1, x2, y2 = np.asarray(line).reshape(-1)[:4]
         if x2 - x1 != 0:
             angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
             if abs(angle) < 45:
