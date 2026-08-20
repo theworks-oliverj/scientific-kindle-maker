@@ -45,9 +45,19 @@ numpy>=1.26.0
 
 # LaTeX rendering
 # tectonic and dvisvgm are BINARIES invoked as subprocesses, not pip packages:
-#   macOS: brew install tectonic dvisvgm
+#   macOS: brew install tectonic dvisvgm ghostscript
 #   Linux: see https://tectonic-typesetting.github.io/en-US/install.html
-#          apt install dvisvgm
+#          apt install dvisvgm ghostscript texlive-latex-base texlive-fonts-recommended
+#
+#          `apt install dvisvgm` alone is NOT enough — dvisvgm is built
+#          against libkpathsea and needs a real TeX Live font/map database
+#          to find the Computer Modern glyphs (cmr, cmmi, ...) our equations
+#          use. Without texlive-fonts-recommended it logs "no font file
+#          found for 'cmmi12'" to stderr but still exits 0, silently
+#          shipping equations with no visible glyphs. ghostscript provides
+#          libgs, which dvisvgm needs to trace the Type1 outlines it finds
+#          into SVG paths. Found the hard way getting CI green — see
+#          README "Tests and CI" and .github/workflows/tests.yml.
 
 # SVG processing and EPUB assembly
 lxml>=5.2.0
