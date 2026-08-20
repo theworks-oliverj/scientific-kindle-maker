@@ -20,6 +20,9 @@ from ..models.enums import FormulaClass, ErrorCode
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
 from ..observability.logger import get_logger
+# Shared with Stage 8A's per-equation gate — see find_orphaned_use_refs
+# docstring for why this whole-document check must never diverge from it.
+from .s09_svg_postprocess import find_orphaned_use_refs
 
 log = get_logger("s10_epub_assembly")
 
@@ -323,13 +326,17 @@ def _svgs_referencing_outside_themselves(xhtml: str) -> list[str]:
     renders as nothing, leaving a partially drawn equation. epubcheck does not
     catch this (the ids do exist, just in the wrong element), which is how a
     file-wide glyph dedup shipped and broke the first equations of a chapter.
+
+    Delegates to find_orphaned_use_refs (Stage 9) per <svg> block rather than
+    keeping its own regex: an earlier version of this function used a
+    hand-rolled pair that quietly diverged from Stage 8A's per-equation gate,
+    which is how 9 equations in a 2205-equation book passed Stage 8A's check
+    with a genuinely undefined glyph and were only caught here, after the
+    whole book had already been assembled — see find_orphaned_use_refs.
     """
     orphans: list[str] = []
     for match in _SVG_ELEMENT_RE.finditer(xhtml):
-        block = match.group(0)
-        defined = set(re.findall(r'<path id="([^"]+)"', block))
-        used = set(re.findall(r'href="#([^"]+)"', block))
-        orphans.extend(sorted(used - defined))
+        orphans.extend(sorted(find_orphaned_use_refs(match.group(0))))
     return orphans
 
 
