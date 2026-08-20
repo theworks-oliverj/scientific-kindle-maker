@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      # ghostscript provides libgs.so.9, which dvisvgm needs (via LIBGS, see
+      # ghostscript provides libgs.so, which dvisvgm needs (via LIBGS, see
       # _dvisvgm_env() in s08a_svg_render.py) to trace Type1/OTF glyphs to
       # paths. Without it, --no-fonts renders produce <use> refs to glyphs
       # that were never defined — caught deliberately as an orphaned-glyph
@@ -36,6 +36,32 @@ jobs:
 
       - name: Install Python dependencies
         run: pip install -r kindle_math_converter/requirements-ci.txt
+
+      # TEMP DEBUG — remove once s08a renders cleanly in CI. Reproduces a
+      # single equation render directly so we get dvisvgm's real stderr,
+      # instead of guessing from the pipeline's swallowed failure_reason.
+      - name: Debug dvisvgm render
+        run: |
+          ldconfig -p | grep -i libgs || echo "no libgs in ldconfig cache"
+          dpkg -L ghostscript | grep libgs || echo "no libgs in ghostscript package"
+          python - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from kindle_math_converter.stages.s08a_svg_render import latex_to_xdv, xdv_to_svg, _dvisvgm_env
+          from kindle_math_converter.models.enums import FormulaClass
+
+          env = _dvisvgm_env()
+          print("LIBGS =", env.get("LIBGS"))
+          print("TEXFONTS =", env.get("TEXFONTS"))
+
+          with tempfile.TemporaryDirectory() as tmpdir:
+              work = Path(tmpdir)
+              xdv = latex_to_xdv("E=mc^2", FormulaClass.INLINE, work, timeout=30)
+              print("xdv ok:", xdv, xdv.stat().st_size, "bytes")
+              svg = xdv_to_svg(xdv, work, timeout=30)
+              print("svg ok, length", len(svg))
+              print(svg[:800])
+          PY
 
       # epubcheck (Java) is deliberately not installed here: the fast test
       # suite runs with epubcheck_enabled=False, and s10_epub_assembly
