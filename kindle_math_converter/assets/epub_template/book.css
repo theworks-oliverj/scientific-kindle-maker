@@ -37,6 +37,21 @@
     border: 1px solid #cc0000;
     padding: 0 4px;
   }
+
+  .unsupported-content {
+    margin: 1em 0;
+    padding: 0.8em 1em;
+    border: 1px solid #999999;
+    background: #f2f2f2;
+    text-align: center;
+    page-break-inside: avoid;
+  }
+
+  .unsupported-content p {
+    font-style: italic;
+    color: #555555;
+    margin: 0;
+  }
 }
 
 /* Fallback for all other EPUB readers */
@@ -70,4 +85,18 @@ body {
   font-family: monospace;
   border: 1px solid #cc0000;
   padding: 0 4px;
+}
+
+.unsupported-content {
+  margin: 1em 0;
+  padding: 0.8em 1em;
+  border: 1px solid #999999;
+  background: #f2f2f2;
+  text-align: center;
+}
+
+.unsupported-content p {
+  font-style: italic;
+  color: #555555;
+  margin: 0;
 }

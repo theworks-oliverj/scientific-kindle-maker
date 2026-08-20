@@ -1,0 +1,8 @@
+# Development-only dependencies — not needed to run `convert`, only to run
+# the test suite (`pytest`, from the project root). Install with:
+#
+#   pip install -r kindle_math_converter/requirements-dev.txt
+#
+# Kept separate from requirements.txt so a normal install (and the Modal GPU
+# image) never pulls test tooling it doesn't need.
+pytest>=8.0.0

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..models.document import Document, EquationRegion
-from ..models.enums import FormulaClass, ErrorCode
+from ..models.enums import FormulaClass, ErrorCode, SourceType
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
 from ..observability.logger import get_logger
@@ -141,6 +141,18 @@ def _render_equation(
             if region.formula_class == FormulaClass.INLINE:
                 return f'<span class="eq-inline">{img}</span>'
             return f'<div class="eq-display">{_eq_number_html(region)}{img}</div>'
+        if region.text_fallback:
+            # EPUB/HTML equations have no page raster to crop a fallback
+            # image from (source_image_crop is always None for them, except
+            # real <img>-sourced equations) — a flagged one with no crop
+            # used to be dropped from the page entirely. This is the same
+            # last-resort text rendering render_as_text already uses: the
+            # MathML's own tokens (s05c_mathml._mathml_text_tokens) or, for
+            # MathJax-sourced equations, the raw LaTeX itself (there is no
+            # separate source representation to tokenize) — either way it
+            # survives even when the derived/given LaTeX is exactly what
+            # failed to compile.
+            return f'<span class="eq-text">{_escape_text(region.text_fallback)}</span>'
         return None
 
     svg = region.svg_postprocessed
@@ -395,11 +407,17 @@ def _document_to_chapters(
     Assembles the whole document into section chapters:
 
     - one global reading-order stream across pages (text, figures, equations)
-    - paragraphs that continue across a page boundary are merged (the
-      previous page's last text unit lacks terminal punctuation), with
-      end-of-line hyphenation removed
-    - a new chapter starts at every heading (MinerU title block); content
-      before the first heading becomes the opening chapter
+    - PDF sources: paragraphs that continue across a page boundary are merged
+      (the previous page's last text unit lacks terminal punctuation), with
+      end-of-line hyphenation removed; a new chapter starts at every heading
+      (MinerU title block) — content before the first heading becomes the
+      opening chapter. Both exist to reconstruct structure the lossy PDF
+      text stream destroyed.
+    - EPUB/HTML sources: no continuation merge (real <p> boundaries are
+      already authoritative); a new chapter starts at every Page (one Page
+      per spine item / HTML file — the EPUB's own chapter structure),
+      titled from `Page.chapter_title`. Interior headings render inline
+      as <h2> without starting a new chapter file.
 
     Returns [(chapter_title, xhtml)].
     """
@@ -457,7 +475,13 @@ def _document_to_chapters(
 
         for figure in page.figures:
             table_html = _valid_table_html(figure.table_html) if figure.table_html else None
-            if table_html is not None:
+            if figure.unsupported_label:
+                fig_html = (
+                    '<div class="unsupported-content">'
+                    f'<p>{_escape_text(figure.unsupported_label)}</p>'
+                    '</div>'
+                )
+            elif table_html is not None:
                 fig_html = f'<div class="figure">{table_html}</div>'
             elif figure.image_bytes:
                 embedded_images[figure.figure_id] = figure.image_bytes
@@ -490,39 +514,58 @@ def _document_to_chapters(
         page_items.sort(key=lambda x: (x[0], x[1]))
         units.extend(item for _, _, item in page_items)
 
-    # ── Pass 2: merge continuation paragraphs across page boundaries ────
-    merged: list[dict] = []
-    for unit in units:
-        prev = merged[-1] if merged else None
-        # A paragraph continues across a column or page break when its
-        # previous half does not end in terminal punctuation. The units are
-        # already in reading order, so adjacency in the stream is the signal;
-        # allow the break within the same page (column) or onto the next
-        # page, but not larger jumps.
-        if (
-            prev is not None
-            and unit.get("inner") is not None
-            and prev.get("inner") is not None
-            and prev["page"] <= unit["page"] <= prev["page"] + 1
-            and unit["kind"] == prev["kind"]
-            and prev["kind"] == "text"
-            and prev["tail"]
-            and not _TERMINAL_TAIL_RE.search(prev["tail"])
-        ):
-            if prev["inner"].rstrip().endswith("-"):
-                prev["inner"] = prev["inner"].rstrip()[:-1] + unit["inner"]
-            else:
-                prev["inner"] = prev["inner"].rstrip() + " " + unit["inner"]
-            prev["tail"] = unit["tail"]
-            prev["page"] = unit["page"]
-            continue
-        merged.append(unit)
+    # EPUB/HTML already has authoritative paragraph and chapter boundaries
+    # (real <p> tags, one Page per spine item) — Pass 2's merge and Pass 3's
+    # heading-triggered rechaptering both exist to reconstruct structure a
+    # lossy PDF text stream destroyed, and applying them to already-correct
+    # EPUB structure risks concatenating two legitimately separate
+    # paragraphs or discarding the EPUB's own spine chaptering.
+    is_reflow_source = document.metadata.source_type in (SourceType.EPUB, SourceType.HTML)
 
-    # ── Pass 3: split into chapters at headings, footnotes at section end ─
+    # ── Pass 2: merge continuation paragraphs across page boundaries ────
+    if is_reflow_source:
+        merged = units
+    else:
+        merged = []
+        for unit in units:
+            prev = merged[-1] if merged else None
+            # A paragraph continues across a column or page break when its
+            # previous half does not end in terminal punctuation. The units are
+            # already in reading order, so adjacency in the stream is the signal;
+            # allow the break within the same page (column) or onto the next
+            # page, but not larger jumps.
+            if (
+                prev is not None
+                and unit.get("inner") is not None
+                and prev.get("inner") is not None
+                and prev["page"] <= unit["page"] <= prev["page"] + 1
+                and unit["kind"] == prev["kind"]
+                and prev["kind"] == "text"
+                and prev["tail"]
+                and not _TERMINAL_TAIL_RE.search(prev["tail"])
+            ):
+                if prev["inner"].rstrip().endswith("-"):
+                    prev["inner"] = prev["inner"].rstrip()[:-1] + unit["inner"]
+                else:
+                    prev["inner"] = prev["inner"].rstrip() + " " + unit["inner"]
+                prev["tail"] = unit["tail"]
+                prev["page"] = unit["page"]
+                continue
+            merged.append(unit)
+
+    # ── Pass 3: split into chapters — at page boundaries for EPUB/HTML (the
+    # spine/file structure is already the chapter structure), at headings
+    # for PDF (see is_reflow_source above) — footnotes placed at section end.
     # `title` is None for a continuation file — same section, split only
     # because it outgrew MAX_CHAPTER_BYTES, and so kept out of the TOC.
+    page_titles: dict[int, Optional[str]] = {
+        page.page_number: page.chapter_title for page in document.pages
+    }
     chapters: list[tuple[Optional[str], list[str]]] = []
-    current_title: Optional[str] = title
+    current_title: Optional[str] = (
+        page_titles.get(merged[0]["page"], title) if (is_reflow_source and merged) else title
+    )
+    current_page: Optional[int] = merged[0]["page"] if merged else None
     current_parts: list[str] = []
     current_bytes = 0
     pending_notes = list(footnotes)      # document order, drained as placed
@@ -595,11 +638,19 @@ def _document_to_chapters(
         refs_in_chapter.update(_NOTEREF_ID_RE.findall(part))
 
     for unit in merged:
-        if unit["kind"] == "heading":
+        if is_reflow_source and unit["page"] != current_page:
+            # New spine item / HTML file — the EPUB's own chapter boundary,
+            # not a heading. Byte-size overflow splitting inside one large
+            # page (_emit's own _flush(split=True)) is unaffected by this.
             _flush()
-            current_title = _EQ_PLACEHOLDER_RE.sub(
-                "", re.sub(r"<[^>]+>", "", unit["inner"])
-            ).strip() or "Untitled section"
+            current_title = page_titles.get(unit["page"], current_title)
+            current_page = unit["page"]
+        if unit["kind"] == "heading":
+            if not is_reflow_source:
+                _flush()
+                current_title = _EQ_PLACEHOLDER_RE.sub(
+                    "", re.sub(r"<[^>]+>", "", unit["inner"])
+                ).strip() or "Untitled section"
             # Headings hold at most inline math — strip any paragraph-split
             # artifacts a display placeholder would have produced.
             heading_inner = unit["inner"].replace("</p>", "").replace("<p>", "")

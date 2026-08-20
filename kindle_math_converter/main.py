@@ -105,7 +105,9 @@ def compare_snapshots_cmd(baseline: str, candidate: str, max_examples: int,
 @click.option("--output-dir", default="./output", show_default=True,
               help="Directory for output files.")
 @click.option("--verbose", is_flag=True, default=False,
-              help="Show detailed per-equation logging in terminal.")
+              help="Echo detailed per-stage/per-equation JSON logging to the "
+                   "terminal as it happens. The log file always gets this "
+                   "detail regardless of this flag.")
 @click.option("--cdm-threshold", default=0.88, show_default=True, type=float,
               help="CDM pass threshold (0–1).")
 @click.option("--font-size", default=LATEX_BODY_PT, show_default=True, type=float,
@@ -197,8 +199,15 @@ def main(
 
     pipeline = Pipeline(config)
 
-    with console.status("[bold green]Processing…", spinner="dots"):
+    if verbose:
+        # The spinner's Live display and raw per-event JSON writes to
+        # stdout (see observability/logger.py's verbose tee) both fight for
+        # the same terminal line — --verbose trades the spinner for the
+        # JSON stream itself as the "it's working" signal.
         result = pipeline.run(input_path, output_dir)
+    else:
+        with console.status("[bold green]Processing…", spinner="dots"):
+            result = pipeline.run(input_path, output_dir)
 
     _print_summary(result, out_dir, stem, open_report)
 

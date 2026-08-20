@@ -4,23 +4,20 @@
 """
 Stage 6 — LaTeX Validation and Repair Loop
 
-Two validation tracks based on source type:
+One validation gate, applied to every source (PDF, EPUB, HTML alike):
+  1. Applies Unicode → LaTeX substitution (Tier 1).
+  2. Applies structural repair rules (Tier 2).
+  3. Compiles with tectonic (binary compile check).
+  4. Scores plausibility of the LaTeX string (heuristic 0–1).
+Thresholds: pass >= 0.65, repair >= 0.40, fallback < 0.40.
 
-  Track A (LATEX_PDF — digital source):
-    Compiles LaTeX with tectonic, computes SSIM against the source crop.
-    Thresholds: pass >= 0.88, repair >= 0.70, fallback < 0.70.
-    SSIM is a valid proxy here because both images are clean renders.
+Repair rules are applied before the first compile attempt.
 
-  Track B (VISUAL_PDF — scanned source):
-    SSIM is invalid: noisy scan vs. clean tectonic render will always
-    score near 0 even for correct LaTeX. Track B instead:
-      1. Applies Unicode → LaTeX substitution (Tier 1).
-      2. Applies structural repair rules (Tier 2).
-      3. Compiles with tectonic (binary compile check).
-      4. Scores plausibility of the LaTeX string (heuristic 0–1).
-    Thresholds: pass >= 0.65, repair >= 0.40, fallback < 0.40.
-
-Repair rules are applied before the first compile attempt in both tracks.
+A second track (SSIM against the source page crop, for digital-PDF sources)
+existed historically but was removed: it mass-flagged correct recognitions
+over mere font differences between the source and tectonic's render, so
+`is_scanned` was hardcoded True for every source — see run() — which made
+that branch permanently unreachable.
 """
 import io
 import re
@@ -37,7 +34,6 @@ from ..models.enums import ConfidenceGate, ErrorCode, FormulaClass
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
 from ..observability.logger import get_logger
-from ..qa.cdm import compute_cdm_score
 
 log = get_logger("s06_validation")
 
@@ -357,28 +353,8 @@ def _classify_tectonic_error(stderr: str, latex: str) -> tuple[str, str]:
     return ErrorCode.CDM_COMPILE_ERROR.value, stderr[:120]
 
 
-def _score_equation_ssim(
-    region: EquationRegion,
-    latex: str,
-    cdm_method: str,
-) -> tuple[float | None, str]:
-    """Track A: SSIM score. Returns (score_or_none, failure_detail)."""
-    if not region.source_image_crop:
-        return 0.95, ""  # EPUB source — no crop available, treat as pass
-
-    rendered_png, stderr = _compile_to_png(latex, region.formula_class)
-    if rendered_png is None:
-        return None, stderr
-
-    try:
-        score = compute_cdm_score(region.source_image_crop, rendered_png, method=cdm_method)
-        return score, ""
-    except Exception as exc:
-        return None, f"SSIM failed: {exc}"
-
-
 # ---------------------------------------------------------------------------
-# Track B — Plausibility scoring (scanned sources)
+# Plausibility scoring
 # ---------------------------------------------------------------------------
 
 _KNOWN_LATEX_COMMANDS: frozenset[str] = frozenset({
@@ -574,11 +550,7 @@ _GATE_RANK: dict[ConfidenceGate, int] = {
 
 def _validate_region(
     region: EquationRegion,
-    is_scanned: bool,
-    cdm_pass_threshold: float,
-    cdm_repair_threshold: float,
     max_repair_attempts: int,
-    cdm_method: str,
     stage: str,
 ) -> dict:
     """
@@ -619,132 +591,55 @@ def _validate_region(
         _fix_row_break_bracket(_apply_unicode_substitutions(region.raw_latex))
     )
 
-    # ── TRACK B — scanned source ─────────────────────────────────────
-    if is_scanned:
-        gate, fr, xdv = _validate_scanned(latex, region)
+    # ── Compile + plausibility gate (the only track — see run()) ─────
+    gate, fr, xdv = _validate_scanned(latex, region)
 
-        # Repair loop: try structural repairs if not already PASS
-        attempts = 0
-        while gate != ConfidenceGate.PASS and attempts < max_repair_attempts:
-            repaired_latex = _apply_repair_rules(latex)
-            if repaired_latex == latex:
-                break  # rules produced no change
-            new_gate, new_fr, new_xdv = _validate_scanned(repaired_latex, region)
-            if _GATE_RANK[new_gate] < _GATE_RANK[gate]:
-                latex = repaired_latex
-                gate = new_gate
-                fr = new_fr
-                xdv = new_xdv
-                region.repair_attempts += 1
-            attempts += 1
-
-        region.normalized_latex = normalize_latex(latex)
-        region.confidence_gate = gate
-        region.failure_reason = fr
-        # Hand the accepted compile to s08a, tagged with the exact string it
-        # came from. A rejected repair candidate never lands here, and s08a
-        # only reuses the XDV when that string matches what it is rendering.
-        region.compiled_xdv = xdv
-        region.compiled_xdv_latex = latex if xdv else None
-
-        if gate == ConfidenceGate.PASS:
-            return {
-                "counter": "passed",
-                "warning": None,
-                "event": ("equation_ok", {"equation_id": region.region_id, "plausibility": region.cdm_score}),
-            }
-        elif gate == ConfidenceGate.REPAIR:
-            return {
-                "counter": "repaired",
-                "warning": f"{region.region_id}: plausibility {region.cdm_score:.2f} — review recommended",
-                "event": ("equation_warning", {"equation_id": region.region_id, "plausibility": region.cdm_score}),
-            }
-        else:
-            region.error_codes.append(fr.code if fr else ErrorCode.LATEX_REPAIR_EXHAUSTED.value)
-            return {
-                "counter": "fallback",
-                "warning": None,
-                "event": ("equation_error", {
-                    "equation_id": region.region_id,
-                    "sub_code": fr.sub_code if fr else "unknown",
-                    "detail": fr.detail if fr else "",
-                }),
-            }
-
-    # ── TRACK A — digital source (SSIM) ──────────────────────────────
-    score, stderr = _score_equation_ssim(region, latex, cdm_method)
-
-    # Repair loop
+    # Repair loop: try structural repairs if not already PASS
     attempts = 0
-    while score is not None and score < cdm_pass_threshold and attempts < max_repair_attempts:
+    while gate != ConfidenceGate.PASS and attempts < max_repair_attempts:
         repaired_latex = _apply_repair_rules(latex)
         if repaired_latex == latex:
-            break
-        new_score, new_stderr = _score_equation_ssim(region, repaired_latex, cdm_method)
-        if new_score is not None and (score is None or new_score > score):
+            break  # rules produced no change
+        new_gate, new_fr, new_xdv = _validate_scanned(repaired_latex, region)
+        if _GATE_RANK[new_gate] < _GATE_RANK[gate]:
             latex = repaired_latex
-            score = new_score
-            stderr = new_stderr
+            gate = new_gate
+            fr = new_fr
+            xdv = new_xdv
+            region.repair_attempts += 1
         attempts += 1
-        region.repair_attempts += 1
 
     region.normalized_latex = normalize_latex(latex)
-    region.cdm_score = score
+    region.confidence_gate = gate
+    region.failure_reason = fr
+    # Hand the accepted compile to s08a, tagged with the exact string it
+    # came from. A rejected repair candidate never lands here, and s08a
+    # only reuses the XDV when that string matches what it is rendering.
+    region.compiled_xdv = xdv
+    region.compiled_xdv_latex = latex if xdv else None
 
-    if score is None:
-        sub_code, detail = _classify_tectonic_error(stderr, latex)
-        region.confidence_gate = ConfidenceGate.FALLBACK
-        region.failure_reason = FailureReason(
-            code=ErrorCode.LATEX_COMPILE_FAILED.value,
-            sub_code=sub_code,
-            stage=stage,
-            detail=detail,
-            recoverable=True,
-        )
-        region.error_codes.append(ErrorCode.LATEX_COMPILE_FAILED.value)
-        return {
-            "counter": "fallback",
-            "warning": None,
-            "event": ("equation_error", {"equation_id": region.region_id, "sub_code": sub_code, "detail": detail}),
-        }
-
-    elif score >= cdm_pass_threshold:
-        region.confidence_gate = ConfidenceGate.PASS
+    if gate == ConfidenceGate.PASS:
         return {
             "counter": "passed",
             "warning": None,
-            "event": ("equation_ok", {"equation_id": region.region_id, "cdm_score": score}),
+            "event": ("equation_ok", {"equation_id": region.region_id, "plausibility": region.cdm_score}),
         }
-
-    elif score >= cdm_repair_threshold and region.repair_attempts > 0:
-        region.confidence_gate = ConfidenceGate.REPAIR
-        region.failure_reason = FailureReason(
-            code=ErrorCode.CDM_RENDER_FAILED.value,
-            sub_code=ErrorCode.CDM_SCANNED_SSIM.value,
-            stage=stage,
-            detail=f"SSIM {score:.3f} after {region.repair_attempts} repair(s)",
-            recoverable=True,
-        )
+    elif gate == ConfidenceGate.REPAIR:
         return {
             "counter": "repaired",
-            "warning": f"{region.region_id}: SSIM {score:.3f} after repair",
-            "event": ("equation_warning", {"equation_id": region.region_id, "cdm_score": score}),
+            "warning": f"{region.region_id}: plausibility {region.cdm_score:.2f} — review recommended",
+            "event": ("equation_warning", {"equation_id": region.region_id, "plausibility": region.cdm_score}),
         }
-
     else:
-        region.confidence_gate = ConfidenceGate.FALLBACK
-        region.failure_reason = FailureReason(
-            code=ErrorCode.LATEX_REPAIR_EXHAUSTED.value,
-            sub_code=ErrorCode.CDM_SCANNED_SSIM.value,
-            stage=stage,
-            detail=f"SSIM {score:.3f} below repair threshold after {region.repair_attempts} attempt(s)",
-            recoverable=False,
-        )
-        region.error_codes.append(ErrorCode.LATEX_REPAIR_EXHAUSTED.value)
+        region.error_codes.append(fr.code if fr else ErrorCode.LATEX_REPAIR_EXHAUSTED.value)
         return {
             "counter": "fallback",
             "warning": None,
-            "event": ("equation_warning", {"equation_id": region.region_id, "cdm_score": score}),
+            "event": ("equation_error", {
+                "equation_id": region.region_id,
+                "sub_code": fr.sub_code if fr else "unknown",
+                "detail": fr.detail if fr else "",
+            }),
         }
 
 
@@ -770,11 +665,9 @@ def run(
     log.info("stage_start", equations=document.total_equation_count)
 
     # All sources now reach s06 via recognition (MinerU for PDFs, MathML
-    # conversion for EPUBs), so the compile+plausibility gate (Track B) is
-    # the single quality gate. Track A (SSIM against the source crop)
-    # predates MinerU and would mass-flag correct recognitions over mere
-    # font differences between the source and tectonic's render.
-    is_scanned = True
+    # conversion for EPUBs), so the compile+plausibility gate is the single
+    # quality gate for every source — see the module docstring for why the
+    # SSIM-against-source-crop track was removed rather than kept dormant.
 
     # ── Skip regions handled outside the SVG pipeline (Stage 5B) ────
     eligible = [
@@ -787,10 +680,7 @@ def run(
 
     results = parallel_for_each(
         eligible,
-        lambda region: _validate_region(
-            region, is_scanned, cdm_pass_threshold, cdm_repair_threshold,
-            max_repair_attempts, cdm_method, stage,
-        ),
+        lambda region: _validate_region(region, max_repair_attempts, stage),
         max_workers=max_parallel_workers,
     )
 
@@ -801,10 +691,7 @@ def run(
     for i, (region, result) in enumerate(zip(eligible, results)):
         if result["counter"] != "fallback":
             continue
-        retry = _validate_region(
-            region, is_scanned, cdm_pass_threshold, cdm_repair_threshold,
-            max_repair_attempts, cdm_method, stage,
-        )
+        retry = _validate_region(region, max_repair_attempts, stage)
         if retry["counter"] != "fallback":
             region.error_codes = [
                 c for c in region.error_codes
@@ -829,8 +716,7 @@ def run(
 
     duration_ms = round((time.perf_counter() - t0) * 1000, 2)
     bus.emit(stage, "stage_end", passed=passed, repaired=repaired, fallback=fallback_count)
-    log.info("stage_end", passed=passed, repaired=repaired, fallback=fallback_count,
-             track="B_scanned" if is_scanned else "A_ssim")
+    log.info("stage_end", passed=passed, repaired=repaired, fallback=fallback_count)
 
     return document, StageResult(
         stage_name=stage,

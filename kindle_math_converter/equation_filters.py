@@ -258,6 +258,14 @@ def normalize_for_dedup(latex: str) -> str:
     return re.sub(r'\s+', ' ', latex.strip())
 
 
+def eq_placeholder(region_id: str) -> str:
+    """Placeholder embedded in TextBlock.raw_text where an equation sits;
+    substituted by s10. Uses only characters that survive XML escaping.
+    Shared by s03_mineru_parse.py and s02c_epub.py — both source paths must
+    emit the exact same format for s10's substitution regex to find it."""
+    return f"[[EQ:{region_id}]]"
+
+
 # ── equation-number tags ──────────────────────────────────────────────────
 
 _TAG_RE = re.compile(r'\\tag\s*\{([^{}]*)\}')

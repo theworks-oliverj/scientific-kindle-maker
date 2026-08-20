@@ -73,6 +73,16 @@ class EquationRegion:
     render_as_text: bool = False               # Set in Stage 5B: simple enough to render as HTML text
     inline_text_repr: Optional[str] = None     # Set in Stage 5B: HTML text repr when render_as_text
     footnote_ref_id: Optional[str] = None      # Set in Stage 3: this "^{N}" marks footnote <id>, linked in s10
+    # Set in Stage 2C/5C (EPUB/HTML only): plain text to show if this
+    # equation is flagged and has no source_image_crop to fall back to as
+    # an image (true for every EPUB/HTML equation except real <img>-sourced
+    # ones). For MathML, built from its own mi/mn/mo/mtext tokens (not from
+    # raw_latex, which may be exactly what failed to compile). For MathJax
+    # ($...$/$$...$$), the raw LaTeX itself, since there is no separate
+    # source representation to tokenize. Last-resort fallback so a flagged
+    # EPUB/HTML equation is never silently dropped — see
+    # s10_epub_assembly._render_equation.
+    text_fallback: Optional[str] = None
     # Set in Stage 6: the XDV from the compile the gate accepted. Stage 8A
     # renders SVG from this instead of compiling the identical .tex a second
     # time (both stages build the wrapper with s06's _build_latex_wrapper).
@@ -107,6 +117,12 @@ class FigureBlock:
     alt_text: str                  # MinerU's VLM description of the image
     reading_order_index: float
     table_html: Optional[str] = None  # MinerU table HTML — preferred over the image when XML-valid
+    # Set in Stage 2C (EPUB/HTML only): a short description of interactive
+    # content (canvas/JS animation) this figure stands in for. When set,
+    # s10 renders a plain user-visible placeholder box instead of an image —
+    # there is no static image to show, and no headless browser in this
+    # pipeline to render one.
+    unsupported_label: Optional[str] = None
 
 
 @dataclass
@@ -119,6 +135,11 @@ class Page:
     text_blocks: list[TextBlock] = field(default_factory=list)
     equation_regions: list[EquationRegion] = field(default_factory=list)
     figures: list[FigureBlock] = field(default_factory=list)
+    # Set in Stage 2C (EPUB/HTML only): the spine item's real title (<title>
+    # or its first heading). s10 uses this as the chapter title directly
+    # instead of re-deriving one from heading detection — the EPUB's own
+    # spine/file boundaries are already its chapter structure.
+    chapter_title: Optional[str] = None
 
 
 @dataclass
