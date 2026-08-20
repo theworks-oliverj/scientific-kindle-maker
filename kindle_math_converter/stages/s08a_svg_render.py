@@ -72,13 +72,22 @@ def _dvisvgm_env() -> dict[str, str]:
         candidates = [
             Path("/opt/homebrew/lib/libgs.dylib"),          # Apple Silicon brew
             Path("/usr/local/lib/libgs.dylib"),              # Intel brew
-            Path("/usr/lib/x86_64-linux-gnu/libgs.so.9"),   # Debian/Ubuntu
             Path("/usr/lib/libgs.so"),
         ]
-        for p in candidates:
-            if p.exists():
-                env["LIBGS"] = str(p)
-                break
+        found = next((p for p in candidates if p.exists()), None)
+        if found is None:
+            # Debian/Ubuntu ships a version-suffixed .so (libgs.so.9,
+            # .so.10, ...) with no unversioned dev symlink unless libgs-dev
+            # is installed — the suffix tracks the Ghostscript package
+            # version, which varies by distro release, so glob for it
+            # rather than hardcoding one.
+            for lib_dir in (Path("/usr/lib/x86_64-linux-gnu"), Path("/usr/lib/aarch64-linux-gnu")):
+                matches = sorted(lib_dir.glob("libgs.so*"))
+                if matches:
+                    found = matches[0]
+                    break
+        if found is not None:
+            env["LIBGS"] = str(found)
 
     # ── Tectonic font cache ──────────────────────────────────────────────
     if "TEXFONTS" not in env:

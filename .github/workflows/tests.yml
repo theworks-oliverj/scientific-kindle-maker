@@ -1,0 +1,49 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  fast-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # dvisvgm is built against libkpathsea and searches a real TeX Live
+      # font/map database for the Computer Modern fonts our equations use
+      # (cmr, cmmi, ...) — apt's dvisvgm package doesn't pull one in, so
+      # without texlive-fonts-recommended it logs "no font file found" and
+      # silently emits <use> refs to glyphs it never defined. ghostscript
+      # provides libgs.so, which dvisvgm needs (via LIBGS, see
+      # _dvisvgm_env() in s08a_svg_render.py) to trace those Type1 outlines
+      # to paths once it can find them.
+      - name: Install system dependencies (dvisvgm, ghostscript, texlive fonts, poppler)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dvisvgm ghostscript texlive-latex-base texlive-fonts-recommended poppler-utils
+
+      # tectonic isn't packaged for Ubuntu's apt; install the pinned release
+      # binary directly rather than piping the upstream install script to sh.
+      - name: Install tectonic
+        run: |
+          curl -fsSL -o tectonic.tar.gz \
+            "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.17.0/tectonic-0.17.0-x86_64-unknown-linux-gnu.tar.gz"
+          tar xzf tectonic.tar.gz
+          sudo mv tectonic /usr/local/bin/
+          tectonic --version
+
+      - name: Install Python dependencies
+        run: pip install -r kindle_math_converter/requirements-ci.txt
+
+      # epubcheck (Java) is deliberately not installed here: the fast test
+      # suite runs with epubcheck_enabled=False, and s10_epub_assembly
+      # already degrades gracefully (logs + skips) when it's absent.
+      - name: Run fast test suite
+        run: pytest -m "not slow"
