@@ -125,8 +125,18 @@ def run(
     try:
         # Determine source type from extension
         if suffix == ".epub":
+            import zipfile
+            if not zipfile.is_zipfile(input_path):
+                errors.append(ErrorCode.EPUB_PARSE_FAILED.value)
+                bus.emit(stage, "stage_end", error="not a valid EPUB (zip) container")
+                return None, StageResult(
+                    stage_name=stage,
+                    ok=False,
+                    duration_ms=round((time.perf_counter() - t0) * 1000, 2),
+                    errors=errors,
+                )
             source_type = SourceType.EPUB
-        elif suffix in (".html", ".htm"):
+        elif suffix in (".html", ".htm", ".xhtml"):
             source_type = SourceType.HTML
         elif suffix == ".pdf":
             source_type = _classify_pdf(input_path, warnings)

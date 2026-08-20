@@ -102,10 +102,18 @@ class Pipeline:
             result.ok = True
         except FatalPipelineError as exc:
             result.fatal_error = str(exc)
-            log.error("pipeline_fatal", error=str(exc))
+            log.error("pipeline_fatal", error=str(exc), exc_info=True)
         except Exception as exc:
+            # Anything landing here is, by definition, a bug we didn't
+            # anticipate and classify (a classified stage failure raises
+            # FatalPipelineError above instead) — the log file captures it
+            # for later, but "handled in the moment" means it also has to
+            # be on-screen right now, not just discoverable three weeks
+            # from now by someone who thinks to check the log file.
             result.fatal_error = str(exc)
-            log.error("pipeline_unexpected_error", error=str(exc))
+            log.error("pipeline_unexpected_error", error=str(exc), exc_info=True)
+            from rich.console import Console
+            Console(stderr=True).print_exception(show_locals=False)
         finally:
             result.finished_at = datetime.utcnow()
 
@@ -142,7 +150,7 @@ class Pipeline:
                 from .qa.latex_snapshot import write_snapshot
                 write_snapshot(document, out_dir, stem)
             except Exception as exc:
-                log.error("report_generation_failed", error=str(exc))
+                log.error("report_generation_failed", error=str(exc), exc_info=True)
 
             self.cache.clear()
 

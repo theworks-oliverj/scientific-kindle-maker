@@ -61,6 +61,25 @@ batch directory names encode, and if they disagree the local run silently
 re-parses the whole book itself at 45 s/page. Step 1 verifies its own output and
 prints the exact step 2 command; copy that rather than retyping it.
 
+### An EPUB or HTML file — no GPU step
+
+```bash
+python main.py convert "path/to/book.epub" --output-dir ~/Desktop/KindleReads/Book
+```
+
+Equations come straight from the file's own MathML (or the publisher's
+embedded LaTeX, when present) — there is no MinerU parse to run, so this is
+CPU-only and its speed doesn't depend on page count the way the PDF path
+does. It scales with **equation count** instead: measured on a real
+~2,200-equation publisher EPUB on a laptop CPU, end-to-end conversion took
+~25 minutes, with Stage 6 (LaTeX compile + repair, one `tectonic` subprocess
+per equation) accounting for ~24.5 of those minutes (~0.7s/equation) —
+everything else (parsing, SVG rendering, assembly) combined is under a
+minute. A short paper with a few dozen equations finishes in seconds.
+See [Convert an EPUB or HTML file](#convert-an-epub-or-html-file) for details
+and [Known limitations](#9-known-limitations) for what this path doesn't
+handle yet (non-standard footnote markup, interactive/canvas content).
+
 ### Five things worth knowing
 
 - **Re-running is cheap.** Completed batches and successful LaTeX compiles are
@@ -269,11 +288,18 @@ All commands are run from the `Scientific Kindle Maker/` directory.
 python main.py convert path/to/paper.pdf
 ```
 
-### Convert an EPUB
+### Convert an EPUB or HTML file
 
 ```bash
 python main.py convert path/to/book.epub
+python main.py convert path/to/chapter.html
 ```
+
+Equations in these sources are read directly from the file's MathML (or, for
+publisher-provided `<annotation encoding="application/x-tex">`, the original
+LaTeX itself) — no MinerU parse needed, so this is CPU-only and fast
+regardless of book length. A plain `.html` file is parsed as a single
+chapter; an `.epub`'s own spine order becomes its chapter list.
 
 ### Common options
 
@@ -812,7 +838,14 @@ for grepping what the recogniser actually produced for a given equation.
 ### `{title}_pipeline.log`
 
 Newline-delimited JSON log. Every stage start/end and every equation event is
-recorded here with timestamps. Useful for deep debugging.
+recorded here with timestamps. Appended to (not overwritten) on re-runs
+against the same output directory, so this survives to be checked weeks
+later even if the book gets reprocessed in the meantime — each run is
+delimited by its own `run_start` event with a `run_id`. Pass `--verbose` to
+also echo these JSON lines to the terminal as they happen; without it, the
+terminal only shows a progress spinner and the final summary (an unexpected,
+unclassified failure still prints a full traceback to the terminal
+regardless of `--verbose`).
 
 ---
 
@@ -884,8 +917,8 @@ Input file
     │
     ▼
 Stage 1 — Classifier
-    Reads the file and determines: is this a LaTeX PDF, a scanned PDF,
-    or an EPUB? Detects math fonts, scanned pages, column layout.
+    Reads the file and determines: is this a LaTeX PDF, a scanned PDF, an
+    EPUB, or HTML? Detects math fonts, scanned pages, column layout.
     ► Fatal if the file is encrypted, empty, or unrecognised format.
     │
     ▼
@@ -893,7 +926,12 @@ Stage 2 — Extraction  (two variants)
     2B PDF:        Rasterises every page to a 300 DPI image, written to a
                    temp directory and decoded one at a time. ALL PDFs take
                    this path — born-digital ones included.
-    2C EPUB/HTML:  Parses MathML elements and equation images from HTML.
+    2C EPUB/HTML:  Walks the document (EPUB: each spine item in order; HTML:
+                   the one file) and builds prose, headings, lists, tables,
+                   figures and footnotes directly from the markup — plus
+                   equations from <math> (MathML) and equation-like <img>
+                   elements, both with placeholders spliced into the
+                   surrounding text exactly like Stage 3 does for PDFs.
     │
     ▼
 Stage 3 — MinerU parse  (PDF only)
@@ -909,7 +947,12 @@ Stage 3 — MinerU parse  (PDF only)
     │
     ▼
 Stage 5C — MathML conversion  (EPUB/HTML only)
-    Converts MathML to LaTeX directly. No model involved.
+    Converts MathML to LaTeX directly — no model involved. Publisher-provided
+    <annotation encoding="application/x-tex"> is used verbatim when present;
+    otherwise LaTeX is derived from the presentation MathML tree. Equations
+    that still fail to compile fall back to plain text built from the
+    MathML's own tokens, rather than being dropped (EPUB/HTML sources have
+    no page raster to crop an image fallback from, unlike PDFs).
     │
     ▼
 Stage 6 — Validation and Repair
@@ -955,11 +998,24 @@ Stage 9 — SVG Post-Processing
     │
     ▼
 Stage 10 — EPUB Assembly
-    Assembles ONE global reading-order stream, not a chapter per page:
-    paragraphs split across a column or page break are rejoined, chapters
-    split at headings, URLs and DOIs become links, footnotes are placed at
-    section end. Chapters over 250 KB are split — Kindle silently fails to
-    render an XHTML file above ~300 KB.
+    Assembles ONE global reading-order stream, not a chapter per page.
+    PDF sources:      paragraphs split across a column or page break are
+                       rejoined, chapters split at headings — reconstructing
+                       structure the lossy PDF text stream destroyed.
+    EPUB/HTML sources: no cross-page merge (real <p> boundaries are already
+                       authoritative); a new chapter starts at each spine
+                       item / HTML file instead, titled from its own <title>
+                       or first heading — the EPUB's own structure is kept
+                       rather than re-derived. Interior headings still
+                       render as <h2> without starting a new chapter file.
+                       A figure standing in for unsupported interactive
+                       content (e.g. a <canvas> widget) renders as a plain
+                       text placeholder box instead of an image — there is
+                       no static image to show and no headless browser in
+                       this pipeline to render one.
+    Both:              URLs and DOIs become links, footnotes are placed at
+                       section end, chapters over 250 KB are split (Kindle
+                       silently fails to render an XHTML file above ~300 KB).
     SVGs are embedded inline in XHTML, never as <object> tags (KindleGen
     rejects those). Runs epubcheck with a timeout scaled to the book size.
     ► Fatal if assembly fails or epubcheck reports errors.
@@ -1215,6 +1271,24 @@ so they do not scale with font size.
 
 **Right-to-left text** — not tested. Documents with Arabic or Hebrew body text
 alongside equations may have incorrect reading order.
+
+**EPUB/HTML footnotes** — built to the EPUB3 spec
+(`epub:type="noteref"`/`"footnote"`), not calibrated against a real book with
+footnotes (the reference fixture used to build this path has none). Older,
+non-standard footnote markup (a bare `<p id="fn1">` with no `epub:type`) is
+not recognised.
+
+**EPUB/HTML MathML derivation** is best-effort when the source has no
+`<annotation encoding="application/x-tex">` (most don't) — like the PDF
+path's recognition, a wrong-but-compilable derivation passes the gate
+silently. Unlike the PDF path, there is no source-image crop to fall back
+to when derivation or compilation fails outright; the fallback is plain
+text built from the MathML's own tokens rather than a raster image.
+
+**EPUB/HTML interactive content** (a `<canvas>`-based widget — a JS
+animation or figure) can't be rendered: there is no static image to show and
+no headless browser in this pipeline to produce one. It's replaced with a
+plain, visibly-labelled placeholder box rather than silently dropped.
 
 **Colour equations** — equations with coloured symbols (e.g. highlighted steps
 in a textbook) lose their colour. Stage 9 replaces all black fills with

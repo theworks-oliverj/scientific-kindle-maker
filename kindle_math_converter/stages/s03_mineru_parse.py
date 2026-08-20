@@ -42,6 +42,7 @@ from typing import Optional
 from PIL import Image  # type: ignore
 
 from ..equation_filters import (
+    eq_placeholder,
     extract_equation_tag,
     normalize_for_dedup,
     simple_text_repr,
@@ -65,12 +66,6 @@ _MEDIA_BLOCK_TYPES = {"image", "table"}
 _FOOTNOTE_BLOCK_TYPE = "page_footnote"
 
 _CROP_PAD_PX = 4
-
-
-def eq_placeholder(region_id: str) -> str:
-    """Placeholder embedded in TextBlock.raw_text where an inline equation
-    sits; substituted by s10. Uses only characters that survive XML escaping."""
-    return f"[[EQ:{region_id}]]"
 
 
 def _find_middle_json(work_dir: Path, pdf_stem: str) -> Optional[Path]:
