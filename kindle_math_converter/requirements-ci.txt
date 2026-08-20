@@ -1,0 +1,28 @@
+# Dependency set for the GitHub Actions fast-test job (pytest -m "not slow").
+#
+# Deliberately excludes mineru: it's invoked as a subprocess only by s03
+# (kindle_math_converter/stages/s03_mineru_parse.py), which the fast/hermetic
+# tests never reach — only the `slow` tests do (test_real_epub.py,
+# test_pdf_regression.py), and those need a book from outside the repo, so
+# they can't run on a hosted runner regardless. Installing mineru's Linux
+# `vllm` extra here would also hit the pip resolver backtracking problem
+# documented in requirements.txt, for no benefit.
+#
+# Keep in sync with requirements.txt (minus the mineru lines) and
+# requirements-dev.txt.
+
+PyMuPDF>=1.24.0
+pdf2image>=1.17.0
+Pillow>=10.0.0
+opencv-contrib-python>=4.9.0
+numpy>=1.26.0
+lxml>=5.2.0
+EbookLib>=0.18
+jinja2>=3.1.0
+rich>=13.0.0
+click>=8.1.0
+structlog>=24.0.0
+scikit-image>=0.22.0
+requests>=2.31.0
+
+pytest>=8.0.0
