@@ -107,24 +107,35 @@ def clean_for_inline_embedding(svg: str) -> str:
     return svg.strip()
 
 
-# Quote- and prefix-agnostic on purpose: dvisvgm's raw output uses single
-# quotes and xlink:href (e.g. <use xlink:href='#g1-82'/>), while by the time
-# an SVG reaches namespace_svg_ids it has been through set_em_dimensions'
-# lxml round-trip (which normalises to double quotes) and
-# clean_for_inline_embedding (xlink:href -> href). Matching both forms lets
-# find_orphaned_use_refs be called at either point without silently finding
-# nothing because it was checking for a form that has not appeared yet.
-_ID_RE = re.compile(r'''\bid=["']([^"']+)["']''')
+# Quote-agnostic on purpose: dvisvgm's raw output uses single quotes and
+# xlink:href (e.g. <use xlink:href='#g1-82'/>), while by the time an SVG
+# reaches namespace_svg_ids it has been through set_em_dimensions' lxml
+# round-trip (which normalises to double quotes) and clean_for_inline_embedding
+# (xlink:href -> href). Matching both forms lets find_orphaned_use_refs be
+# called at either point without silently finding nothing because it was
+# checking for a form that has not appeared yet.
+#
+# _ID_RE deliberately only counts an id declared on a <path> element as a
+# real glyph definition — NOT an id on any element. dvisvgm's orphaned-glyph
+# bug (see module docstring) doesn't always drop the id="..." token itself;
+# sometimes it emits a wrapper element (observed: <g id="g1-126">) at the
+# broken glyph's slot with no <path id="g1-126"> anywhere, and a sibling
+# <use href="#g1-126"/> that still points at it. A `\bid=` match (any
+# element) reads that wrapper as "defined" and misses the orphan; requiring
+# `<path id=` catches it, because dvisvgm only ever emits actual glyph
+# outlines as <path> elements. This must stay a strict superset of what a
+# looser check would flag — see find_orphaned_use_refs docstring.
+_ID_RE = re.compile(r'''<path\s+id=["']([^"']+)["']''')
 _HREF_RE = re.compile(r'''(?:xlink:)?href=["']#([^"']+)["']''')
 
 
 def find_orphaned_use_refs(svg: str) -> set[str]:
-    """Ids that a href="#..." names but that no id="..." in `svg` declares.
+    """Ids that a href="#..." names but that no <path id="..."> declares.
 
     dvisvgm's contract is that every glyph a <use> draws is defined in that
-    same render's own <defs> — but it does not always hold it. Found on a
-    271-page book: a handful of equations came back from dvisvgm with a
-    `<use xlink:href='#g1-82'/>` and no matching `<path id='g1-82'>`
+    same render's own <defs> as a <path> — but it does not always hold it.
+    Found on a 271-page book: a handful of equations came back from dvisvgm
+    with a `<use xlink:href='#g1-82'/>` and no matching `<path id='g1-82'>`
     anywhere in that equation's own SVG — the glyph was simply never
     emitted. A DIFFERENT, unrelated equation happened to define its own
     glyph under the same locally-numbered id ("gN-MM" is font-index +
@@ -132,6 +143,18 @@ def find_orphaned_use_refs(svg: str) -> set[str]:
     which is how this reads as a real id if you only check "does this string
     appear somewhere in the document" rather than "is it defined in THIS
     equation's own render."
+
+    A second, later incident (2205-equation book, 2026-08-19) showed this
+    check must require the id to be on a <path> specifically: dvisvgm's
+    broken-glyph slot can carry an id on a non-<path> wrapper element, which
+    a bare "does this id string appear anywhere" check reads as satisfied —
+    9 equations passed this per-equation gate with a genuinely undefined
+    glyph and were only caught by Stage 10's whole-document check, after the
+    entire book had already been assembled. This function must always be at
+    least as strict as Stage 10's check (never looser), because it is the
+    one meant to catch this early and degrade gracefully — see
+    _svgs_referencing_outside_themselves in s10_epub_assembly.py, which
+    delegates to this same primitive rather than keeping its own regex.
 
     `namespace_svg_ids` cannot catch this: it only rewrites ids it can find
     declared, so an orphaned reference passes through it untouched and
