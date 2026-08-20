@@ -29,6 +29,7 @@ License: [AGPL-3.0](LICENSE) — see
 7. [The pipeline — what happens inside](#7-the-pipeline--what-happens-inside)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Known limitations](#9-known-limitations)
+   - [Tests and CI](#9b-tests-and-ci)
 10. [License and third-party components](#10-license-and-third-party-components)
 
 ---
@@ -289,8 +290,14 @@ platform-specific beyond the binaries in [Installation](#3-installation).
   backtracks indefinitely. See [Installation](#3-installation).
 - Homebrew's `brew install tectonic dvisvgm poppler` doesn't apply. Install
   [tectonic](https://tectonic-typesetting.github.io/en-US/install.html)
-  directly, and `apt install dvisvgm poppler-utils epubcheck` (or your
-  distro's equivalent) for the rest.
+  directly, and
+  `apt install dvisvgm ghostscript texlive-latex-base texlive-fonts-recommended poppler-utils epubcheck`
+  (or your distro's equivalent) for the rest. **`apt install dvisvgm` alone
+  is not enough**: without a real TeX Live font/map database (from
+  `texlive-fonts-recommended`) and `libgs` (from `ghostscript`), dvisvgm
+  can't find or trace the Computer Modern glyphs equations use — it exits 0
+  but ships equations with no visible symbols. This is exactly what CI's
+  first real run caught; see [Tests and CI](#9b-tests-and-ci).
 - **Recognition output differs from the Mac path and is not run-to-run
   reproducible** — vLLM's batched execution reorders floating-point
   reductions between runs. This is a property of the CUDA path itself, not a
@@ -1577,6 +1584,83 @@ before converting.
 
 **Scanned PDFs with skew > 5°** — the deskew step handles minor rotation but
 heavily skewed scans will produce poor detection results.
+
+---
+
+## 9b. Tests and CI
+
+```bash
+pytest -m "not slow"     # the hermetic subset — what CI runs
+pytest                   # everything, including the two local-only tests below
+```
+
+Every push to `main` and every pull request runs the fast subset in GitHub
+Actions ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) — a
+visible status check on the PR and commit, not a required one: this repo is
+private on GitHub's free tier, which doesn't support required status checks
+or branch protection, so nothing server-side blocks a merge on a red check.
+
+**A green check means the hermetic subset passed — not "regression
+verified."** Two tests never run in CI, and can't:
+
+- `test_real_epub.py` — a real publisher EPUB from the user's personal
+  library
+- `test_pdf_regression.py` — a PDF of unclear provenance, same reason
+
+Both need a file that lives outside the repo and are marked `slow`
+accordingly. `test_tdho_pdf_regression.py` is the portable answer for the
+PDF path: an openly-licensed (CC BY 4.0) arXiv excerpt committed at
+`kindle_math_converter/tests/fixtures/tdho/`, with a pruned local MinerU
+parse and a baseline LaTeX-recognition snapshot, so it runs in CI for real.
+There's no equivalent yet for the EPUB path's publisher-MathML coverage —
+open, if anyone wants to add one.
+
+**Fixture policy**: anything committed as a test fixture must be openly
+licensed (CC BY, public domain, or similar) with an `ATTRIBUTION.md` next to
+it recording the source, license, and author. Personal-library files stay
+local-only and `slow`-marked — that's not a workaround to fix, it's the
+correct handling of unclear-provenance content.
+
+**Regenerating the `tdho` baseline**, if recognition legitimately changes
+(a MinerU/tectonic/dvisvgm upgrade, a pipeline change to how equations are
+recognised):
+
+```bash
+python -m kindle_math_converter.main convert \
+  kindle_math_converter/tests/fixtures/tdho/tdho_excerpt.pdf \
+  --output-dir /tmp/tdho_rebuild
+```
+
+Then, in a Python shell (or a throwaway script) reusing the freshly-cached
+parse from that output dir:
+
+```python
+from datetime import datetime
+from pathlib import Path
+from kindle_math_converter.models.results import PipelineResult
+from kindle_math_converter.pipeline import Pipeline, PipelineConfig
+from kindle_math_converter.qa.latex_snapshot import write_snapshot
+
+FIX = Path("kindle_math_converter/tests/fixtures/tdho")
+pipeline = Pipeline(PipelineConfig(output_dir="/tmp/tdho_rebuild", epubcheck_enabled=False))
+result = PipelineResult(document_path=str(FIX / "tdho_excerpt.pdf"),
+                         started_at=datetime.utcnow(), finished_at=None,
+                         ok=False, output_epub_path=None)
+document = pipeline._run_stages(str(FIX / "tdho_excerpt.pdf"), "/tmp/tdho_rebuild", result)
+write_snapshot(document, FIX, "tdho_baseline")
+```
+
+Then copy just the new `<stem>_middle.json` into
+`fixtures/tdho/mineru/batch_00000_00011/tdho_excerpt/vlm/` (nothing else
+MinerU writes — `layout.pdf`, `images/`, `content_list*.json`, the `.md` —
+is read by the pipeline's reuse path, so don't commit them). Two gotchas:
+
+- **Run the parse locally, never on Modal.** Remote/GPU parses are not
+  run-to-run reproducible (see
+  [Local runs are reproducible; GPU runs are not](#local-runs-are-reproducible-gpu-runs-are-not)),
+  which would make an exact-snapshot test flaky by design.
+- `.gitignore` has blanket `*.pdf` and `*.log` rules — committing the PDF
+  fixture (not the log) needs `git add -f`.
 
 ---
 
