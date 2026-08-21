@@ -463,6 +463,15 @@ LaTeX itself) — no MinerU parse needed, so this is CPU-only and fast
 regardless of book length. A plain `.html` file is parsed as a single
 chapter; an `.epub`'s own spine order becomes its chapter list.
 
+MathJax/KaTeX-style `$...$`/`$$...$$` delimited equations (no `<math>` tag at
+all — the common case for a Claude-generated HTML artifact) are also
+detected, including inside `<table>` cells. `<pre>` code blocks are kept as
+one monospace block, not shredded into disconnected paragraphs. `<script>`,
+`<style>`, `<button>`, and `<!-- comments -->` are dropped rather than
+rendered as text — nothing on a Kindle can run the JavaScript behind an
+interactive widget, so a `<canvas>`-based animation is replaced with a
+labelled placeholder instead (see [Known limitations](#9-known-limitations)).
+
 ### Common options
 
 ```bash
@@ -1549,10 +1558,12 @@ crops rather than render as scalable SVG. Not a bug in this pipeline; each
 affected equation is caught and degrades to a raster crop of the real
 equation automatically, never silently missing content.
 
-**Tables containing equations** — tables are inlined as HTML when MinerU's
-output parses as valid `<table>` markup, and fall back to a page-image crop
-otherwise. Equations inside a table are not extracted as equations either way,
-so they do not scale with font size.
+**Tables containing equations (PDF path only)** — tables are inlined as HTML
+when MinerU's output parses as valid `<table>` markup, and fall back to a
+page-image crop otherwise. Equations inside a table are not extracted as
+equations either way, so they do not scale with font size. EPUB/HTML tables
+are different: MathJax-style `$...$` equations in a cell *are* detected and
+rendered as scalable SVG, same as anywhere else in the document.
 
 **Right-to-left text** — not tested. Documents with Arabic or Hebrew body text
 alongside equations may have incorrect reading order.
