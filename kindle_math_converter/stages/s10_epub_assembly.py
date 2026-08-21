@@ -74,6 +74,21 @@ span.eq-inline img.eq-img-fallback { height: 1.2em; width: auto; vertical-align:
 .figure { text-align: center; margin: 1em 0; }
 .figure img { max-width: 100%; }
 
+/* Code blocks (<pre> in the source, typically syntax-highlighted). Kindle
+   screens are narrow, so a fixed-width pre with no wrap overflows off the
+   page — pre-wrap keeps original line breaks but lets long lines fold. */
+pre.code {
+  font-family: monospace;
+  font-size: 0.8em;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  background: #f5f5f0;
+  border: 1px solid #ccc;
+  padding: 0.6em;
+  margin: 1em 0;
+}
+
 /* Footnotes recovered from the page furniture, collected at the end of the
    section holding their reference. Ordinary paragraphs on purpose — the
    EPUB3 popup markup gets hidden by reading systems (see _footnote_html). */
@@ -457,11 +472,21 @@ def _document_to_chapters(
             if not block.raw_text.strip():
                 continue
             order = block.reading_order_index if block.reading_order_index is not None else block.bbox.y0
-            inner = _EQ_PLACEHOLDER_RE.sub(
-                _substitute_placeholder, _linkify(_escape_text(block.raw_text))
-            )
-            # Visible tail (placeholders stripped) decides merge behaviour.
-            tail = _EQ_PLACEHOLDER_RE.sub("", block.raw_text).rstrip()
+            if block.kind == "code":
+                # Not prose: no equation placeholders were ever spliced into
+                # code text (s02c_epub._emit_code_block bypasses the MathJax
+                # substitution pass), and _linkify must not rewrite a bare
+                # URL sitting in a comment or a shell "$VAR" into a <a>/eq
+                # span. Escaping still applies — the code text is going
+                # inside <pre><code>, so its own < > & need entities.
+                inner = _escape_text(block.raw_text)
+                tail = block.raw_text.rstrip()
+            else:
+                inner = _EQ_PLACEHOLDER_RE.sub(
+                    _substitute_placeholder, _linkify(_escape_text(block.raw_text))
+                )
+                # Visible tail (placeholders stripped) decides merge behaviour.
+                tail = _EQ_PLACEHOLDER_RE.sub("", block.raw_text).rstrip()
             if block.kind == "footnote":
                 footnotes.append({
                     "footnote_id": block.footnote_id, "inner": inner,
@@ -482,6 +507,16 @@ def _document_to_chapters(
                     '</div>'
                 )
             elif table_html is not None:
+                # s02c_epub._substitute_table_math leaves [[EQ:region_id]]
+                # placeholders as literal text inside cells (table_html is
+                # raw markup, never routed through _escape_text/_linkify).
+                # .replace() strips _substitute_placeholder's "</p><p>"
+                # display-equation split — meaningless inside a <td>, and
+                # would otherwise nest a paragraph break inside a table cell.
+                table_html = _EQ_PLACEHOLDER_RE.sub(
+                    lambda m: _substitute_placeholder(m).replace("</p>", "").replace("<p>", ""),
+                    table_html,
+                )
                 fig_html = f'<div class="figure">{table_html}</div>'
             elif figure.image_bytes:
                 embedded_images[figure.figure_id] = figure.image_bytes
@@ -574,6 +609,9 @@ def _document_to_chapters(
     }
     refs_in_chapter: set[str] = set()    # note ids whose marker appeared here
     max_page_in_chapter = 0
+    # True right after a heading is emitted, until the next unit joins it —
+    # see _emit's use of it below.
+    last_was_heading = False
 
     def _place_notes(final: bool = False) -> list[str]:
         """Notes owed by the section just closed.
@@ -614,7 +652,7 @@ def _document_to_chapters(
         in the next file, so its notes-so-far are settled here (their markers
         are in THIS file) and the next file carries no TOC entry."""
         nonlocal current_parts, current_bytes, refs_in_chapter
-        nonlocal max_page_in_chapter, current_title
+        nonlocal max_page_in_chapter, current_title, last_was_heading
         notes = _place_notes(final) if (current_parts or final) else []
         if current_parts or notes:
             chapters.append((current_title, current_parts + notes))
@@ -624,18 +662,31 @@ def _document_to_chapters(
         current_bytes = 0
         refs_in_chapter = set()
         max_page_in_chapter = 0
+        last_was_heading = False
 
-    def _emit(part: str, page: int) -> None:
-        nonlocal max_page_in_chapter, current_bytes
+    def _emit(part: str, page: int, is_heading: bool = False) -> None:
+        nonlocal max_page_in_chapter, current_bytes, last_was_heading
         # Close the file BEFORE the unit that would overflow it, so the budget
         # is a real ceiling rather than one oversized equation past it. Breaks
         # only between units, so no paragraph or equation is ever cut.
-        if current_parts and current_bytes + len(part) > MAX_CHAPTER_BYTES:
+        #
+        # Exception: never split right after a heading. A heading with
+        # nothing under it yet is not a real section boundary — the split
+        # would leave a bare "<h2>Nondimensionalization</h2>" as the last
+        # line of one file and the paragraph that explains it as the first
+        # line of the next, which reading systems that start each XHTML
+        # file on a fresh page render as an orphaned page containing only a
+        # heading (found via a real Claude-artifact HTML page whose
+        # "Nondimensionalization" subsection landed exactly there). Suppress
+        # the check for one call so the heading's first content unit is
+        # guaranteed to land in the same file, however large that makes it.
+        if current_parts and not last_was_heading and current_bytes + len(part) > MAX_CHAPTER_BYTES:
             _flush(split=True)
         current_parts.append(part)
         current_bytes += len(part)
         max_page_in_chapter = max(max_page_in_chapter, page)
         refs_in_chapter.update(_NOTEREF_ID_RE.findall(part))
+        last_was_heading = is_heading
 
     for unit in merged:
         if is_reflow_source and unit["page"] != current_page:
@@ -654,7 +705,9 @@ def _document_to_chapters(
             # Headings hold at most inline math — strip any paragraph-split
             # artifacts a display placeholder would have produced.
             heading_inner = unit["inner"].replace("</p>", "").replace("<p>", "")
-            _emit(f"<h2>{heading_inner}</h2>", unit["page"])
+            _emit(f"<h2>{heading_inner}</h2>", unit["page"], is_heading=True)
+        elif unit["kind"] == "code":
+            _emit(f'<pre class="code"><code>{unit["inner"]}</code></pre>', unit["page"])
         elif unit.get("inner") is not None:
             _emit(_EMPTY_P_RE.sub("", f'<p>{unit["inner"]}</p>'), unit["page"])
         else:

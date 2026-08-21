@@ -400,23 +400,31 @@ _PHYSICS_SIGNALS: frozenset[str] = frozenset({
 })
 
 
-def _plausibility_score(latex: str) -> float:
+def _plausibility_score(latex: str, *, trusted_source: bool = False) -> float:
     """
     Heuristic plausibility score for a LaTeX string, 0–1.
     Does not require compilation. Used for Track B (scanned sources).
+
+    trusted_source: True when raw_latex came directly from the document's own
+    markup (EPUB MathML / MathJax) rather than image-based recognition
+    (MinerU on a PDF crop). The short-equation penalties below exist to catch
+    recognition noise — a single stray character OCR'd out of a scanned page
+    — which doesn't apply to trusted markup, where "$q$" or "$L$" are common,
+    entirely correct equations. Penalising them for brevity was flagging
+    genuine single-letter variable references as unrecognised.
     """
     stripped = latex.strip()
     if not stripped:
         return 0.0
     if len(stripped) < 2:
-        return 0.05
+        return 1.0 if trusted_source else 0.05
 
     score = 1.0
 
     # Length penalties
     if len(stripped) > 600:
         score -= 0.15
-    if len(stripped) < 4:
+    if len(stripped) < 4 and not trusted_source:
         score -= 0.3
 
     # Structural: unmatched braces
@@ -497,8 +505,12 @@ def _validate_scanned(
             recoverable=sub_code in (ErrorCode.CDM_UNDEFINED_CMD.value, ErrorCode.CDM_BRACE_MISMATCH.value),
         ), None
 
-    # Plausibility scoring
-    score = _plausibility_score(latex)
+    # Plausibility scoring. source_image_crop is None for every EPUB/HTML
+    # equation except real <img>-sourced ones (set in s02c_epub.py) and set
+    # for essentially every PDF equation reaching this gate (set from the
+    # page raster in s03_mineru_parse.py) — a reliable proxy for whether
+    # raw_latex came from trusted markup or image-based recognition.
+    score = _plausibility_score(latex, trusted_source=region.source_image_crop is None)
     region.cdm_score = score
 
     if score >= 0.65:

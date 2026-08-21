@@ -6,9 +6,11 @@ Stage 2C — EPUB/HTML Parse
 
 Walks each spine document (EPUB) or the single input file (bare HTML) in DOM
 order, producing the same shapes Stage 3 (MinerU) produces for PDF sources:
-TextBlocks (prose/headings/lists/footnotes) with `[[EQ:region_id]]`
+TextBlocks (prose/headings/lists/footnotes/code) with `[[EQ:region_id]]`
 placeholders spliced in at each inline equation, EquationRegions (from
 <math> and equation-like <img>), and FigureBlocks (other <img>, <table>).
+<script>/<style>/<noscript>/<template> are dropped rather than walked —
+see _SKIP_TAGS.
 
 Equations are left as raw MathML ("MATHML:...") for Stage 5C to convert —
 unchanged contract with s05c_mathml.py.
@@ -45,6 +47,17 @@ _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 # Elements whose content becomes one TextBlock each.
 _TEXT_BLOCK_TAGS = {"p", "li", "dd", "dt"} | _HEADING_TAGS
 _LIST_TAGS = {"ul", "ol", "dl"}
+# Non-content tags: never real prose even when they carry a bare text node,
+# so they must never reach the generic-container fallback in _walk_block
+# (which treats "no child produced content, but elem.text is non-empty" as
+# a lost paragraph and emits it verbatim). A <script> full of interactive-
+# widget JS is exactly that shape — found via a real Claude-artifact HTML
+# page whose ~460-line <script> block landed in the EPUB as one giant
+# prose paragraph before this set existed. <button> is the same shape at
+# smaller scale: a "Copy"/"Pause / Resume" label that does nothing once
+# there is no JS to click it, found leaking in as its own bare paragraph
+# next to a code block's copy-to-clipboard control.
+_SKIP_TAGS = {"script", "style", "noscript", "template", "button"}
 
 LATEX_HINT_PATTERN = re.compile(r'[\\^_]|\\[a-zA-Z]+')
 MATH_CLASS_PATTERN = re.compile(r'\bmath\b', re.IGNORECASE)
@@ -311,6 +324,11 @@ class _ChapterWalker:
         here would be double-escaped."""
         parts: list[str] = [elem.text or ""]
         for child in elem:
+            if not isinstance(child.tag, str):
+                # <!-- comment --> child — see _walk_block's guard for why
+                # this must not recurse (its own .text is the comment body).
+                parts.append(child.tail or "")
+                continue
             tag = _local(child.tag)
             if tag == "math":
                 region = self._make_equation_region(child, self._next_order())
@@ -356,6 +374,60 @@ class _ChapterWalker:
         if kind == "heading" and self.title_hint is None:
             self.title_hint = re.sub(r'\[\[EQ:[A-Za-z0-9_]+\]\]', '', raw_text).strip() or None
 
+    def _emit_code_block(self, elem) -> None:
+        """<pre> (typically syntax-highlighted via nested <span>s, as Claude
+        artifacts commonly emit). Walked with itertext() rather than the
+        generic block recursion: _walk_block's per-child-element walk only
+        ever looks at element children, so bare text nodes sitting between
+        spans (e.g. "numpy" between <span class="kw">import</span> and
+        <span class="kw">as</span>) are never visited by anything and were
+        silently dropped, while each span itself fell through to the "no
+        child produced content" fallback and became its own disconnected
+        paragraph — losing both structure and content. itertext() walks
+        every text node in document order regardless of nesting, so this
+        also skips MathJax/equation substitution and _linkify on purpose:
+        code is not prose, and a literal "$" (shell) or bare URL in a
+        comment must not be rewritten.
+        """
+        order = self._next_order()
+        text = "".join(elem.itertext())
+        if text.startswith("\n"):
+            text = text[1:]  # browsers ignore one leading newline right after <pre>
+        text = text.rstrip("\n")
+        if not text.strip():
+            return
+        self.page.text_blocks.append(
+            TextBlock(
+                block_id=f"tb_{self.chapter_num}_{len(self.page.text_blocks) + 1}",
+                bbox=self._new_bbox(order),
+                raw_text=text,
+                reading_order_index=order,
+                kind="code",
+            )
+        )
+
+    def _substitute_table_math(self, table_elem) -> None:
+        """Runs the same $...$/$$...$$/\\(...\\)/\\[...\\] substitution
+        _emit_text_block applies to prose, over every text node inside a
+        <table> subtree, in place.
+
+        Tables are captured as raw HTML (_table_html_no_ns) rather than
+        walked into TextBlocks, since a table's structure has to survive
+        verbatim — but that means MathJax-delimited equations sitting in a
+        cell were never substituted at all, and serialized as literal
+        "$...$" text in the output instead of rendering. Found via a real
+        Claude-artifact HTML page whose "Dimensionless numbers" table left
+        every cell's $\\mathsf{Ro} = ...$ as raw, unrendered LaTeX text.
+        Mutating .text/.tail on the live lxml tree (rather than building a
+        new one) is safe here because _table_html_no_ns serializes this
+        same elem right after this call returns.
+        """
+        for el in table_elem.iter():
+            if el.text:
+                el.text = self._substitute_mathjax(el.text)
+            if el is not table_elem and el.tail:
+                el.tail = self._substitute_mathjax(el.tail)
+
     # ── block-level walk ──────────────────────────────────────────────
 
     def walk_body(self, body) -> None:
@@ -363,6 +435,17 @@ class _ChapterWalker:
             self._walk_block(child)
 
     def _walk_block(self, elem) -> None:
+        # lxml represents <!-- comments --> and <?processing instructions?>
+        # as elements too, with a non-string callable .tag (etree.Comment /
+        # etree.PI) rather than a real tag name. _local() maps that to "",
+        # which used to fall through every branch below to the generic-
+        # container "no child produced content, elem.text is non-empty"
+        # fallback and emit the comment's own text as a paragraph — found
+        # via a real Claude-artifact HTML page whose "<!-- ====... -->"
+        # section-divider and "<!-- INTERACTIVE LAB SCRIPTS -->" comments
+        # both landed in the EPUB as literal prose.
+        if not isinstance(elem.tag, str):
+            return
         tag = _local(elem.tag)
 
         if tag in _TEXT_BLOCK_TAGS:
@@ -377,7 +460,15 @@ class _ChapterWalker:
                     self._emit_text_block(item, kind="list_item")
             return
 
+        if tag in _SKIP_TAGS:
+            return
+
+        if tag == "pre":
+            self._emit_code_block(elem)
+            return
+
         if tag == "table":
+            self._substitute_table_math(elem)
             table_html = _table_html_no_ns(elem)
             if table_html:
                 order = self._next_order()
