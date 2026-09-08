@@ -521,7 +521,7 @@ def _document_to_chapters(
             elif figure.image_bytes:
                 embedded_images[figure.figure_id] = figure.image_bytes
                 fig_html = (
-                    f'<div class="figure"><img alt="{_escape_text(figure.alt_text)}" '
+                    f'<div class="figure"><img alt="{_escape_alt_text(figure.alt_text)}" '
                     f'src="../images/{figure.figure_id}.png"/></div>'
                 )
             else:
@@ -733,6 +733,21 @@ def _escape_text(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+# Amazon's "Enhanced Mobi" converter finds the end of an <img> tag by scanning
+# for '>' without honouring quoted attribute values, so any '>' inside alt text
+# truncates the tag and fails the entire book with E21018 -- the generic E999
+# the Send to Kindle web form reports. Escaping does not help: verified against
+# Kindle Previewer 3.107.0, all of '>', '&gt;' and '&#62;' fail, while '&lt;',
+# '&amp;' and '&quot;' convert cleanly. So the character itself has to go.
+# U+FF1E FULLWIDTH GREATER-THAN keeps the meaning legible to a screen reader.
+_ALT_SAFE_GT = "\uff1e"
+
+
+def _escape_alt_text(text: str) -> str:
+    """Escape text for an <img alt="..."> value, dropping Kindle-fatal '>'."""
+    return _escape_text(text.replace(">", _ALT_SAFE_GT))
 
 
 def _build_opf(
