@@ -240,6 +240,24 @@ KINDLE_MAX_FILE_BYTES = 300_000
 # after the budget has already been checked, so the ceiling has to leave room
 # for a section's worth of footnotes plus the template.
 MAX_CHAPTER_BYTES = 220_000
+
+# Amazon's Send to Kindle converter rejects a book whose TOTAL number of inline
+# <svg> elements is too high, with a bare E999 and no diagnostic. Established by
+# bisection across 15 uploads (2026-09-08/09): 1054 elements converts, 1342 does
+# not. The ceiling is on the count of <svg> ELEMENTS per book and nothing else —
+# these were each contradicted by a direct pass/fail inversion:
+#
+#   compressed EPUB size   3.44 MB passed, 3.03 MB failed
+#   uncompressed bytes     17.87 MB passed, 1.13 MB failed
+#   XHTML file count       180 passed, 61 failed
+#   svg-BEARING file count 180 passed, 20 failed
+#   PNG count              44 passed, 22 failed
+#
+# Kindle Previewer does NOT reproduce this — it converts the oversized books
+# happily — so the only way to stay safe is to keep the count under budget.
+# 900 sits below the largest observed pass (1054) with headroom.
+KINDLE_MAX_EQUATIONS_PER_VOLUME = 900
+
 # The footnote id an emitted in-text marker points at (see _render_equation).
 _NOTEREF_ID_RE = re.compile(r'<a class="noteref"[^>]*href="#(fn_[^"]+)"')
 
@@ -521,7 +539,7 @@ def _document_to_chapters(
             elif figure.image_bytes:
                 embedded_images[figure.figure_id] = figure.image_bytes
                 fig_html = (
-                    f'<div class="figure"><img alt="{_escape_text(figure.alt_text)}" '
+                    f'<div class="figure"><img alt="{_escape_alt_text(figure.alt_text)}" '
                     f'src="../images/{figure.figure_id}.png"/></div>'
                 )
             else:
@@ -735,6 +753,21 @@ def _escape_text(text: str) -> str:
     )
 
 
+# Amazon's "Enhanced Mobi" converter finds the end of an <img> tag by scanning
+# for '>' without honouring quoted attribute values, so any '>' inside alt text
+# truncates the tag and fails the entire book with E21018 -- the generic E999
+# the Send to Kindle web form reports. Escaping does not help: verified against
+# Kindle Previewer 3.107.0, all of '>', '&gt;' and '&#62;' fail, while '&lt;',
+# '&amp;' and '&quot;' convert cleanly. So the character itself has to go.
+# U+FF1E FULLWIDTH GREATER-THAN keeps the meaning legible to a screen reader.
+_ALT_SAFE_GT = "\uff1e"
+
+
+def _escape_alt_text(text: str) -> str:
+    """Escape text for an <img alt="..."> value, dropping Kindle-fatal '>'."""
+    return _escape_text(text.replace(">", _ALT_SAFE_GT))
+
+
 def _build_opf(
     title: str,
     author: str,
@@ -830,6 +863,82 @@ def _build_ncx(title: str, uid: str, chapter_titles: list[tuple[int, str]]) -> s
 """
 
 
+def _equation_count(xhtml: str) -> int:
+    """Inline <svg> elements in one chapter — what Kindle's ceiling counts."""
+    return xhtml.count("<svg")
+
+
+def _write_epub_zip(
+    path: Path,
+    title: str,
+    author: str,
+    uid: str,
+    chapters_xhtml: list[str],
+    chapter_titles: list[tuple[int, str]],
+    images: dict[str, bytes],
+) -> None:
+    """Write one complete, self-contained EPUB 3 container."""
+    import zipfile
+
+    with zipfile.ZipFile(str(path), "w", zipfile.ZIP_DEFLATED) as zf:
+        # mimetype must be first and uncompressed
+        zf.writestr(
+            zipfile.ZipInfo("mimetype"),
+            "application/epub+zip",
+            compress_type=zipfile.ZIP_STORED,
+        )
+        zf.writestr("META-INF/container.xml", """\
+<?xml version="1.0" encoding="utf-8"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+""")
+        zf.writestr("OEBPS/styles/book.css", BOOK_CSS)
+        for i, xhtml in enumerate(chapters_xhtml):
+            zf.writestr(f"OEBPS/content/chapter_{i+1:03d}.xhtml", xhtml)
+        for img_id, png_bytes in images.items():
+            zf.writestr(f"OEBPS/images/{img_id}.png", png_bytes)
+        zf.writestr("OEBPS/nav.xhtml", _build_nav(title, chapter_titles))
+        zf.writestr("OEBPS/toc.ncx", _build_ncx(title, uid, chapter_titles))
+        zf.writestr(
+            "OEBPS/content.opf",
+            _build_opf(title, author, uid, chapters_xhtml, sorted(images)),
+        )
+
+
+def _partition_into_volumes(
+    titled_chapters: list[tuple[Optional[str], str]],
+    budget: int,
+) -> list[list[int]]:
+    """
+    Group chapter indices into volumes of at most `budget` equations each.
+
+    Cuts land only where a chapter carries a TOC title, so a section split across
+    continuation files by MAX_CHAPTER_BYTES is never torn across two volumes.
+    A single chapter over budget cannot be split further here and gets a volume
+    of its own — the caller warns about it.
+    """
+    if budget <= 0:
+        return [list(range(len(titled_chapters)))]
+
+    volumes: list[list[int]] = []
+    current: list[int] = []
+    current_eq = 0
+    for i, (title, xhtml) in enumerate(titled_chapters):
+        eq = _equation_count(xhtml)
+        can_cut = title is not None          # never cut before a continuation file
+        if current and can_cut and current_eq + eq > budget:
+            volumes.append(current)
+            current, current_eq = [], 0
+        current.append(i)
+        current_eq += eq
+    if current:
+        volumes.append(current)
+    return volumes
+
+
 def _iso_now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -914,8 +1023,18 @@ def run(
     output_path: Path,
     bus: EventBus,
     epubcheck_enabled: bool = True,
+    max_equations_per_volume: Optional[int] = KINDLE_MAX_EQUATIONS_PER_VOLUME,
 ) -> tuple[Path, StageResult]:
-    import zipfile
+    """
+    Assemble the document into an EPUB at `output_path`.
+
+    When the book carries more than `max_equations_per_volume` inline <svg>
+    elements it is split into `_vol01`, `_vol02`, … files alongside
+    `output_path`, because Amazon's Send to Kindle converter rejects an
+    over-budget book outright with an undiagnosable E999. Pass None to disable
+    splitting. The returned path is the first volume; every volume written is
+    listed in `StageResult.metrics["volume_paths"]`.
+    """
     import os
 
     t0 = time.perf_counter()
@@ -938,11 +1057,9 @@ def run(
         # fallbacks are collected as embedded images.
         fallback_images: dict[str, bytes] = {}
         titled_chapters = _document_to_chapters(document, title, bus, fallback_images)
-        # Continuation files (title None) stay in the manifest and spine but
-        # out of the TOC — see MAX_CHAPTER_BYTES.
-        chapter_titles = [
-            (i, t) for i, (t, _) in enumerate(titled_chapters) if t is not None
-        ]
+        # Continuation files (title None) stay in the manifest and spine but out
+        # of the TOC — see MAX_CHAPTER_BYTES. Per-volume TOC entries are built
+        # from titled_chapters below, once the volume grouping is known.
         chapters_xhtml = [x for _, x in titled_chapters]
 
         # Guard the two silent-corruption classes epubcheck cannot see: a
@@ -970,49 +1087,68 @@ def run(
                 warnings=warnings, errors=errors,
             )
 
-        with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zf:
-            # mimetype must be first and uncompressed
-            zf.writestr(
-                zipfile.ZipInfo("mimetype"),
-                "application/epub+zip",
-                compress_type=zipfile.ZIP_STORED,
+        # Kindle rejects a whole book whose inline <svg> count is too high, so
+        # split into volumes when over budget. Cuts land on TOC-titled chapters.
+        total_equations = sum(_equation_count(x) for x in chapters_xhtml)
+        budget = max_equations_per_volume or 0
+        groups = (
+            _partition_into_volumes(titled_chapters, budget)
+            if budget and total_equations > budget
+            else [list(range(len(chapters_xhtml)))]
+        )
+
+        volume_paths: list[Path] = []
+        for vol_no, indices in enumerate(groups, 1):
+            single = len(groups) == 1
+            vol_title = title if single else f"{title} — Volume {vol_no} of {len(groups)}"
+            vol_path = output_path if single else output_path.with_name(
+                f"{output_path.stem}_vol{vol_no:02d}{output_path.suffix}"
             )
-
-            # META-INF/container.xml
-            container_xml = """\
-<?xml version="1.0" encoding="utf-8"?>
-<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
-  <rootfiles>
-    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
-  </rootfiles>
-</container>
-"""
-            zf.writestr("META-INF/container.xml", container_xml)
-
-            # Stylesheet
-            zf.writestr("OEBPS/styles/book.css", BOOK_CSS)
-
-            # Chapter XHTML files
-            for i, xhtml in enumerate(chapters_xhtml):
-                zf.writestr(f"OEBPS/content/chapter_{i+1:03d}.xhtml", xhtml)
-
-            # Raster fallbacks for flagged equations
-            for img_id, png_bytes in fallback_images.items():
-                zf.writestr(f"OEBPS/images/{img_id}.png", png_bytes)
-
-            # Navigation
-            zf.writestr("OEBPS/nav.xhtml", _build_nav(title, chapter_titles))
-            zf.writestr("OEBPS/toc.ncx", _build_ncx(title, uid, chapter_titles))
-
-            # Package document
-            zf.writestr(
-                "OEBPS/content.opf",
-                _build_opf(title, author, uid, chapters_xhtml, sorted(fallback_images)),
+            vol_chapters = [chapters_xhtml[i] for i in indices]
+            # renumber TOC entries against this volume's own chapter ordering
+            pos = {orig: new for new, orig in enumerate(indices)}
+            vol_titles: list[tuple[int, str]] = [
+                (pos[i], t) for i in indices
+                if (t := titled_chapters[i][0]) is not None
+            ]
+            # carry only the images this volume's chapters actually reference
+            vol_images = {
+                img_id: png for img_id, png in fallback_images.items()
+                if any(f"{img_id}.png" in x for x in vol_chapters)
+            }
+            _write_epub_zip(
+                vol_path, vol_title, author,
+                uid if single else str(uuid.uuid4()),
+                vol_chapters, vol_titles, vol_images,
             )
+            volume_paths.append(vol_path)
 
-        # Run epubcheck
+            vol_eq = sum(_equation_count(x) for x in vol_chapters)
+            if budget and vol_eq > budget:
+                # one indivisible chapter over budget — cannot split further here
+                warnings.append(
+                    f"volume {vol_no}: {vol_eq} equations exceeds the "
+                    f"{budget}-equation Kindle budget and could not be split further"
+                )
+                log.warning("volume_over_budget", volume=vol_no, equations=vol_eq)
+
+        if len(groups) > 1:
+            warnings.append(
+                f"{total_equations} equations exceeds the {budget}-equation Kindle "
+                f"limit; split into {len(groups)} volumes"
+            )
+            log.info("split_into_volumes", volumes=len(groups),
+                     equations=total_equations, budget=budget)
+            bus.emit(stage, "volumes_split",
+                     volumes=len(groups), equations=total_equations)
+
+        # Run epubcheck on every volume — a split that broke one manifest must
+        # not slip through because volume 1 happened to be clean.
         if epubcheck_enabled:
-            epubcheck_errors = _run_epubcheck(output_path, bus)
+            epubcheck_errors = [
+                err for vol_path in volume_paths
+                for err in _run_epubcheck(vol_path, bus)
+            ]
             if epubcheck_errors:
                 for err in epubcheck_errors:
                     errors.append(err)
@@ -1030,15 +1166,21 @@ def run(
 
         duration_ms = round((time.perf_counter() - t0) * 1000, 2)
         bus.emit(stage, "stage_end", chapters=len(chapters_xhtml))
-        log.info("stage_end", output_path=str(output_path), chapters=len(chapters_xhtml))
+        log.info("stage_end", output_path=str(output_path),
+                 chapters=len(chapters_xhtml), volumes=len(volume_paths))
 
-        return output_path, StageResult(
+        return volume_paths[0], StageResult(
             stage_name=stage,
             ok=True,
             duration_ms=duration_ms,
             warnings=warnings,
             errors=errors,
-            metrics={"chapters": len(chapters_xhtml)},
+            metrics={
+                "chapters": len(chapters_xhtml),
+                "equations": total_equations,
+                "volumes": len(volume_paths),
+                "volume_paths": [str(p) for p in volume_paths],
+            },
         )
 
     except Exception as exc:

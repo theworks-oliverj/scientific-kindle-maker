@@ -83,9 +83,28 @@ def run(
         output_dir.mkdir(parents=True, exist_ok=True)
         stem = Path(result.document_path).stem
 
-        # Copy EPUB to final location
+        # Copy EPUB to final location. An equation-heavy book is split by s10
+        # into <stem>_assembled_volNN.epub siblings (see
+        # KINDLE_MAX_EQUATIONS_PER_VOLUME); every volume has to be delivered,
+        # not just the one s10 handed back.
         final_epub = output_dir / f"{stem}.epub"
-        if epub_path.exists():
+        volumes = sorted(epub_path.parent.glob(f"{epub_path.stem}_vol*.epub")) \
+            if "_vol" not in epub_path.stem else []
+        if volumes:
+            delivered = []
+            for vol in volumes:
+                suffix = vol.stem.split("_vol")[-1]
+                dst = output_dir / f"{stem}_vol{suffix}.epub"
+                shutil.copy2(str(vol), str(dst))
+                delivered.append(dst)
+            result.output_epub_path = str(delivered[0])
+            warnings.append(
+                f"book exceeded Kindle's per-book equation limit; delivered "
+                f"{len(delivered)} volumes: {', '.join(p.name for p in delivered)}"
+            )
+            log.info("delivered_volumes", count=len(delivered))
+            final_epub = delivered[0]
+        elif epub_path.exists():
             shutil.copy2(str(epub_path), str(final_epub))
             result.output_epub_path = str(final_epub)
 
