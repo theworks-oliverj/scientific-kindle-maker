@@ -29,6 +29,7 @@ License: [AGPL-3.0](LICENSE) — see
 7. [The pipeline — what happens inside](#7-the-pipeline--what-happens-inside)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Known limitations](#9-known-limitations)
+   - [Amazon's per-book equation limit](#amazons-per-book-equation-limit) — why a big textbook comes out as several volumes
    - [Tests and CI](#9b-tests-and-ci)
 10. [License and third-party components](#10-license-and-third-party-components)
 
@@ -201,6 +202,10 @@ handle yet (non-standard footnote markup, interactive/canvas content).
   see [Local runs are reproducible; GPU runs are not](#local-runs-are-reproducible-gpu-runs-are-not).
 - **Everything is checked at the end.** `epubcheck` runs automatically and is
   fatal, so a completed run means a structurally valid EPUB.
+- **A very equation-heavy book comes out as several volumes.** Amazon's
+  converter rejects a book with too many equations outright, so books over the
+  limit are split into `1_of_N_{title}.epub` files — send each to your Kindle.
+  See [Amazon's per-book equation limit](#amazons-per-book-equation-limit).
 
 ---
 
@@ -1026,6 +1031,19 @@ The converted book. Send this to your Kindle via the
 [Send to Kindle](https://www.amazon.com/sendtokindle) website or app.
 Amazon converts it to their internal KFX format automatically.
 
+### `1_of_N_{title}.epub`, `2_of_N_{title}.epub`, … (equation-heavy books only)
+
+If the book contains more equations than Amazon's converter accepts, you get a
+numbered set of volumes **instead of** a single `{title}.epub`. Send each one to
+your Kindle; they appear as separate books in your library, in reading order.
+
+The volume marker leads the filename so a split book is obvious at a glance and
+the parts sort correctly in any file listing.
+
+This is not a cosmetic choice — see
+[Amazon's per-book equation limit](#amazons-per-book-equation-limit) for why a
+book over the limit cannot be delivered as one file at all.
+
 ### `{title}_report.html`
 
 Open this in any browser. It contains:
@@ -1324,6 +1342,36 @@ Stage 11 — Output
 
 ## 8. Troubleshooting
 
+### Send to Kindle says "Failed. Please retry." (error E999)
+
+E999 is Amazon's generic conversion failure and carries no diagnostic. Two
+causes are known, both now handled by the pipeline:
+
+1. **Too many equations in one book.** Amazon rejects a book above roughly
+   1,100 inline `<svg>` elements. Output built by a current version of this
+   pipeline is split into `1_of_N_{title}.epub` volumes automatically — send
+   each volume separately. See
+   [Amazon's per-book equation limit](#amazons-per-book-equation-limit).
+2. **A `>` character in figure alt text.** Amazon's parser scans for `>` to end
+   an `<img>` tag without honouring quoted attributes, so a single `>` anywhere
+   in alt text fails the entire book. Fixed in `s10_epub_assembly`.
+
+Note that **`epubcheck` and Kindle Previewer both pass files that E999** — a
+clean local validation does not mean Amazon will accept it.
+
+To see a real error instead of E999, convert locally with
+[Kindle Previewer 3](https://www.amazon.com/Kindle-Previewer/b?node=21381691011):
+
+```bash
+"/Applications/Kindle Previewer 3.app/Contents/MacOS/Kindle Previewer 3" \
+    book.epub -convert -output ./kpout
+cat ./kpout/Logs/book_log.csv
+```
+
+It emits named errors (e.g. `E21018`) with a source file and line number. It
+will **not** reproduce the equation-count limit, but it catches most other
+conversion failures in seconds rather than a 20-minute upload round-trip.
+
 ### Installation errors
 
 **`ERROR: ResolutionImpossible`, or pip hangs for minutes during install**
@@ -1528,6 +1576,52 @@ Open `{title}_report.html` in any browser. Key things to look for:
 ---
 
 ## 9. Known limitations
+
+### Amazon's per-book equation limit
+
+**Amazon's Send to Kindle converter rejects a book containing too many
+equations, with a generic `E999` and no explanation.** This is a limit in
+Amazon's service, not a bug in this pipeline, and there is no way to work around
+it other than splitting the book.
+
+Measured by bisection across 15 real uploads (2026-09):
+
+| inline `<svg>` elements in the book | Send to Kindle |
+|---|---|
+| 1,054 | converts |
+| 1,342 | **E999** |
+
+The ceiling counts inline `<svg>` **elements per book** and nothing else. Each of
+these was ruled out by a direct pass/fail inversion — a larger value succeeding
+while a smaller one failed:
+
+| ruled out | evidence |
+|---|---|
+| compressed EPUB size | 3.44 MB passed, 3.03 MB failed |
+| uncompressed bytes | 17.87 MB passed, 1.13 MB failed |
+| number of XHTML files | 180 passed, 61 failed |
+| files containing SVG | 180 passed, 20 failed |
+| number of images | 44 passed, 22 failed |
+| tables | a full book with every table stripped still failed |
+
+Amazon's published 200 MB limit is irrelevant here — the books that fail are
+7 MB. KFX conversion expands a book by a uniform ~2.3× regardless of equation
+density, so there is no hidden size blow-up either.
+
+**`epubcheck` and Kindle Previewer both accept the oversized books.** Previewer
+reports `Supported / Success / 0 errors` on a file Send to Kindle then rejects,
+so no local tool catches this. Staying under budget is the only protection.
+
+**What the pipeline does:** `s10_epub_assembly` counts inline `<svg>` per chapter
+and, above `KINDLE_MAX_EQUATIONS_PER_VOLUME` (900 — below the 1,054 known to
+pass), splits the book into `1_of_N_{title}.epub` volumes. Cuts land only on
+chapter boundaries, so no section is torn in half, and each volume gets its own
+identifier so Kindle does not deduplicate one against another. Books under the
+limit are unaffected and still produce a single file.
+
+A 3,000-equation textbook becomes four volumes. That is a real cost —
+cross-volume links do not resolve and the book occupies four library slots — but
+the alternative is a book that cannot be delivered at all.
 
 **Handwritten equations** — not supported. MinerU is trained on typeset
 academic documents.

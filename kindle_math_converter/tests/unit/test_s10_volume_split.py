@@ -88,7 +88,7 @@ def test_default_budget_sits_below_the_largest_observed_pass():
     assert KINDLE_MAX_EQUATIONS_PER_VOLUME < 1054
 
 
-def _run_assembly(tmp_path, chapters, budget, monkeypatch):
+def _run_assembly(tmp_path, chapters, budget, monkeypatch, source_type=None):
     """Drive s10.run() with a stubbed chapter builder, no epubcheck."""
     from kindle_math_converter.observability.event_bus import EventBus
     from kindle_math_converter.stages import s10_epub_assembly as s10
@@ -99,9 +99,9 @@ def _run_assembly(tmp_path, chapters, budget, monkeypatch):
                         lambda *a, **k: [(t, s10.XHTML_TEMPLATE.format(title=t or "c", body=b))
                                          for t, b in chapters])
     doc = Document(metadata=DocumentMetadata(
-        source_path="book.pdf", source_type=SourceType.LATEX_PDF, title="Book",
-        author="A", page_count=1, has_math_fonts=True, is_scanned=False,
-        column_layout=ColumnLayout.SINGLE))
+        source_path="book.pdf", source_type=source_type or SourceType.LATEX_PDF,
+        title="Book", author="A", page_count=1, has_math_fonts=True,
+        is_scanned=False, column_layout=ColumnLayout.SINGLE))
     out = tmp_path / "book_assembled.epub"
     path, res = s10.run(doc, out, EventBus(), epubcheck_enabled=False,
                         max_equations_per_volume=budget)
@@ -114,7 +114,7 @@ def test_run_writes_one_file_when_under_budget(tmp_path, monkeypatch):
     assert res.ok
     assert path.name == "book_assembled.epub"
     assert res.metrics["volumes"] == 1
-    assert not list(tmp_path.glob("*_vol*.epub"))
+    assert not list(tmp_path.glob("*_of_*.epub"))
 
 
 def test_run_writes_separate_valid_volumes_when_over_budget(tmp_path, monkeypatch):
@@ -123,7 +123,7 @@ def test_run_writes_separate_valid_volumes_when_over_budget(tmp_path, monkeypatc
     assert res.ok
     assert res.metrics["volumes"] == 2
     assert res.metrics["equations"] == 1600
-    vols = sorted(tmp_path.glob("book_assembled_vol*.epub"))
+    vols = sorted(tmp_path.glob("*_of_*_book_assembled.epub"))
     assert len(vols) == 2
     assert path == vols[0]
 
@@ -146,11 +146,39 @@ def test_run_writes_separate_valid_volumes_when_over_budget(tmp_path, monkeypatc
     assert seen_chapters == 4, "chapters lost or duplicated across volumes"
 
 
+def test_volume_filenames_lead_with_the_volume_marker(tmp_path, monkeypatch):
+    """`N_of_X_` first makes a split book obvious at a glance and sorts the
+    volumes in reading order in any file listing."""
+    chapters = [(f"C{i}", "<svg></svg>" * 400) for i in range(4)]
+    _run_assembly(tmp_path, chapters, 900, monkeypatch)
+    names = sorted(p.name for p in tmp_path.glob("*.epub"))
+    assert names == ["1_of_2_book_assembled.epub", "2_of_2_book_assembled.epub"]
+    # lexical sort must equal reading order
+    assert names == sorted(names)
+
+
+def test_splitting_is_source_agnostic(tmp_path, monkeypatch):
+    """PDF and EPUB/HTML inputs diverge at stages 2-5 but converge on the same
+    s10 assembly, so the split must apply identically to every source type."""
+    from kindle_math_converter.models.enums import SourceType
+
+    chapters = [(f"C{i}", "<svg></svg>" * 400) for i in range(4)]
+    counts = {}
+    for st in (SourceType.LATEX_PDF, SourceType.VISUAL_PDF,
+               SourceType.EPUB, SourceType.HTML):
+        d = tmp_path / st.value
+        d.mkdir()
+        _, res = _run_assembly(d, chapters, 900, monkeypatch, source_type=st)
+        counts[st.value] = res.metrics["volumes"]
+        assert len(list(d.glob("*_of_*.epub"))) == 2, f"{st.value} not split"
+    assert len(set(counts.values())) == 1, f"source type changed the split: {counts}"
+
+
 def test_volumes_get_distinct_identifiers_and_titles(tmp_path, monkeypatch):
     chapters = [(f"C{i}", "<svg></svg>" * 400) for i in range(4)]
     _run_assembly(tmp_path, chapters, 900, monkeypatch)
     uids, titles = set(), set()
-    for v in sorted(tmp_path.glob("book_assembled_vol*.epub")):
+    for v in sorted(tmp_path.glob("*_of_*_book_assembled.epub")):
         with zipfile.ZipFile(v) as z:
             opf = z.read("OEBPS/content.opf").decode()
         uids.add(opf.split('id="uid">')[1].split("<")[0])

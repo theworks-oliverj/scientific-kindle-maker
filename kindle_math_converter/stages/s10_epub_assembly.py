@@ -1101,8 +1101,10 @@ def run(
         for vol_no, indices in enumerate(groups, 1):
             single = len(groups) == 1
             vol_title = title if single else f"{title} — Volume {vol_no} of {len(groups)}"
+            # Volume marker goes FIRST in the filename so a split book is
+            # obvious at a glance and sorts in reading order in any file list.
             vol_path = output_path if single else output_path.with_name(
-                f"{output_path.stem}_vol{vol_no:02d}{output_path.suffix}"
+                f"{vol_no}_of_{len(groups)}_{output_path.stem}{output_path.suffix}"
             )
             vol_chapters = [chapters_xhtml[i] for i in indices]
             # renumber TOC entries against this volume's own chapter ordering
