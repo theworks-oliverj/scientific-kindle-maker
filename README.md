@@ -30,6 +30,7 @@ License: [AGPL-3.0](LICENSE) — see
 8. [Troubleshooting](#8-troubleshooting)
 9. [Known limitations](#9-known-limitations)
    - [Amazon's per-book equation limit](#amazons-per-book-equation-limit) — why a big textbook comes out as several volumes
+   - [MathML migration — status and the `\mathrm` problem](#mathml-migration--status-and-the-mathrm-problem)
    - [Tests and CI](#9b-tests-and-ci)
 10. [License and third-party components](#10-license-and-third-party-components)
 
@@ -1244,6 +1245,10 @@ Stage 2 — Extraction  (two variants)
                    equations from <math> (MathML) and equation-like <img>
                    elements, both with placeholders spliced into the
                    surrounding text exactly like Stage 3 does for PDFs.
+                   A Markdown pipe table sitting in a paragraph is recovered
+                   into real table markup here too — same shared code as the
+                   PDF path, so content generated from Markdown behaves the
+                   same whichever door it comes in through.
     │
     ▼
 Stage 3 — MinerU parse  (PDF only)
@@ -1255,6 +1260,14 @@ Stage 3 — MinerU parse  (PDF only)
     raster.
     Reuses any parse already on disk, which is what makes a GPU-parsed book
     and a resumed run both work.
+    Two table repairs happen here, both shared with the EPUB/HTML path
+    (kindle_math_converter/table_math.py):
+      • maths in table cells. MinerU leaves it as bare, undelimited LaTeX,
+        which would otherwise reach the reader as "\langle \ldots \rangle".
+        Each run is registered as an ordinary equation and renders normally.
+      • a table the VLM transcribed as a Markdown pipe table, which lands in
+        a paragraph and reads as literal pipes and dashes. Recovered into
+        real table markup, then its maths is registered the same way.
     ► Fatal if a batch fails; completed batches survive for the re-run.
     │
     ▼
@@ -1622,6 +1635,42 @@ limit are unaffected and still produce a single file.
 A 3,000-equation textbook becomes four volumes. That is a real cost —
 cross-volume links do not resolve and the book occupies four library slots — but
 the alternative is a book that cannot be delivered at all.
+
+### MathML migration — status and the `\mathrm` problem
+
+Equations currently ship as **inline SVG** (dvisvgm glyph outlines). That is a
+vector *picture* of the equation: it scales cleanly, but it is not selectable,
+reflowable, or accessible text. **MathML** would be — and it would also sidestep
+[Amazon's per-book equation limit](#amazons-per-book-equation-limit) entirely,
+since that ceiling counts `<svg>` elements specifically.
+
+Confirmed so far, by upload:
+
+- A book carrying **3,125 MathML equations converts** where the same book with
+  3,125 SVG equations fails. The ceiling really is SVG-specific.
+- `latex2mathml` converts **100%** of a 3,899-equation corpus without raising.
+
+**Not yet adopted, because of a known fidelity regression:**
+
+> `latex2mathml` renders `\mathrm{d}` as `<mi>d</mi>` with **no
+> `mathvariant="normal"`**, so upright operators come out *italic*. Every
+> differential (`dx`, `dt`) and every upright superscript is affected —
+> **1,128 of 3,899 equations (29%)** in the reference corpus.
+
+This is fixable with a post-processing pass over the generated MathML (set
+`mathvariant="normal"` on `<mi>` elements derived from `\mathrm`/`\text`), but
+it must be done before MathML can replace SVG, or the output is typographically
+worse than today despite being structurally better.
+
+Also unverified, and worth checking before committing to a switch:
+
+- **Rendering quality on device.** "Converts without error" is not "renders
+  correctly" — Kindle's MathML support is historically uneven. `\mathcal` (9% of
+  the corpus), `\boldsymbol` (4%) and multi-line `\begin{array}` blocks (2%) need
+  visual spot-checks.
+- **Equation numbering and alignment** in multi-line environments.
+
+Until those are settled, SVG plus volume splitting remains the shipping path.
 
 **Handwritten equations** — not supported. MinerU is trained on typeset
 academic documents.

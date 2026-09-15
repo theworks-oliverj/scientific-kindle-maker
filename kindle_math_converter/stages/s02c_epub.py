@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ..equation_filters import eq_placeholder
+from ..table_math import pipe_table_to_html, substitute_table_math
 from ..models.document import (
     BoundingBox,
     Document,
@@ -356,10 +357,37 @@ class _ChapterWalker:
             parts.append(child.tail or "")
         return "".join(parts)
 
+    def _emit_pipe_table(self, raw_text: str, order: float) -> bool:
+        """A Markdown pipe table sitting in a paragraph — common in content
+        generated from Markdown, and exactly what MinerU's VLM emits when it
+        transcribes a table-shaped figure (see s03). Without this the reader
+        gets literal pipes and dashes. Shared with the MinerU path so both
+        sources recover it identically."""
+        html = pipe_table_to_html(raw_text)
+        if html is None:
+            return False
+        html = substitute_table_math(html, self._make_table_equation)
+        self.page.figures.append(FigureBlock(
+            figure_id=f"fig_{self.chapter_num}_{len(self.page.figures) + 1}",
+            bbox=self._new_bbox(order),
+            image_bytes=None,
+            alt_text="table",
+            reading_order_index=order,
+            table_html=html,
+        ))
+        return True
+
+    def _make_table_equation(self, latex: str) -> str:
+        """Register one equation found in recovered table markup."""
+        region = self._make_mathjax_region(latex, False, self._next_order())
+        return eq_placeholder(region.region_id)
+
     def _emit_text_block(self, elem, kind: str, footnote_id: Optional[str] = None) -> None:
         order = self._next_order()
         raw_text = self._substitute_mathjax(self._inline_text(elem)).strip()
         if not raw_text:
+            return
+        if self._emit_pipe_table(raw_text, order):
             return
         self.page.text_blocks.append(
             TextBlock(

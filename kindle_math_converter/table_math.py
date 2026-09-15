@@ -2,6 +2,24 @@
 # Copyright (C) 2026 Oliver Jandette
 
 """
+Recovering tables that arrive as something other than real table markup, and
+the maths inside them.
+
+Two problems, one module because the second is the fix for the first:
+
+1. A table that arrives as a **Markdown pipe table in a paragraph**. MinerU's
+   VLM describes a table-shaped figure by writing GFM ("| t | w |\\n| --- |
+   --- |"), and that lands in a <p>, so the reader sees pipes and dashes
+   instead of a table. Peliti shipped 27 of these, Hartmann 76.
+
+2. A table whose cells carry **bare, undelimited LaTeX** — see below.
+
+Both are source-agnostic: `pipe_table_to_html` and `substitute_table_math` are
+called from the MinerU path (s03) and the EPUB/HTML path (s02c) alike, so a
+pipe table pasted into an EPUB is recovered the same way as one MinerU invents.
+
+──────────────────────────────────────────────────────────────────────────────
+
 Finding bare LaTeX inside MinerU table cells.
 
 MinerU emits a table's HTML with the maths left as raw LaTeX in the cells and
@@ -25,9 +43,15 @@ left-to-right tokenizer cut identifiers off their own subscripts, turning
 `A_\\alpha` into `A` + `_\\alpha`.
 """
 import re
+from typing import Optional
 
 _CMD = re.compile(r"\\[a-zA-Z]+\*?|\\[^a-zA-Z]")
-_IDENT_CHAR = re.compile(r"[A-Za-z0-9']")
+# An identifier character. Unicode-aware on purpose: OCR'd maths routinely
+# arrives with real Greek letters and combining accents rather than control
+# sequences ("σ²_p", "χ̂(n)"), and an ASCII-only class cut the base symbol off
+# its own script, emitting the fragment "^{2}_p" as an equation of its own.
+# `_` is excluded because it is the subscript operator, not part of a name.
+_IDENT_CHAR = re.compile(r"[^\W_]|['\u0300-\u036f\u00b2\u00b3\u00b9]", re.UNICODE)
 # A prose word: 3+ letters. Two anywhere in the cell make it prose — they need
 # not be adjacent, because short connectives ("of", "in") break up a run:
 # "Affinity of cycle \alpha." is prose plus maths, not one big equation.
@@ -94,6 +118,9 @@ def _grow_right(s: str, j: int) -> int:
             j = _close_group(s, j, "(", ")")
         elif _IDENT_CHAR.match(s[j]) and j > 0 and s[j - 1] in "_^{}\\)":
             j += 1
+            # a combining accent belongs to the character it sits on
+            while j < len(s) and "̀" <= s[j] <= "ͯ":
+                j += 1
         else:
             break
     return j
@@ -188,24 +215,106 @@ def segment_cell(cell: str) -> list[tuple[str, str]]:
 # rewritten and the table's own markup survives verbatim.
 _CELL_TEXT = re.compile(r"(<t[dh]\b[^>]*>)(.*?)(</t[dh]>)", re.S | re.I)
 
+# Delimited maths, in case a cell carries it: MinerU's VLM writes \(...\) when
+# it transcribes a table as Markdown, and pasted EPUB/HTML content can carry
+# any of these. Longest delimiters first so $$ wins over $.
+_DELIMITED = re.compile(
+    r"\\\[(?P<d1>.+?)\\\]|\\\((?P<i1>.+?)\\\)|\$\$(?P<d2>.+?)\$\$|\$(?P<i2>.+?)\$",
+    re.S,
+)
+# An already-registered placeholder. Must be stepped over rather than re-parsed:
+# "[[EQ:eq_1]]" contains an underscore, which the bare-LaTeX scanner would
+# otherwise treat as a subscript.
+_PLACEHOLDER = re.compile(r"\[\[EQ:[A-Za-z0-9_]+\]\]")
+
 
 def substitute_table_math(table_html: str, make_equation) -> str:
     """
-    Replace bare LaTeX in every cell of `table_html` with equation placeholders.
+    Replace the maths in every cell of `table_html` with equation placeholders.
+
+    Handles both delimited maths (``\\(...\\)``, ``$...$``) and bare LaTeX, so a
+    cell is covered whether it came from MinerU, from a Markdown pipe table, or
+    from pasted EPUB/HTML.
 
     `make_equation(latex) -> placeholder` is called once per maths run and is
-    responsible for registering the region; returning the placeholder string to
-    splice in. Cells containing no maths are left byte-identical.
+    responsible for registering the region, returning the placeholder to splice
+    in. Cells containing no maths are left byte-identical.
     """
+    def rewrite_plain(text: str) -> str:
+        """Bare-LaTeX pass over a stretch known to hold no placeholders."""
+        if not _ANY_MATH.search(text):
+            return text
+        return "".join(
+            make_equation(chunk) if kind == "math" else chunk
+            for kind, chunk in segment_cell(text)
+        )
+
     def cell(m: "re.Match[str]") -> str:
         open_tag, body, close_tag = m.group(1), m.group(2), m.group(3)
-        # only rewrite plain text — a cell carrying nested markup is left alone
-        if "<" in body or not _ANY_MATH.search(body):
+        # a cell carrying its own markup is left alone: rewriting it risks
+        # corrupting the table for no gain
+        if "<" in body:
             return m.group(0)
-        rebuilt = "".join(
-            make_equation(chunk) if kind == "math" else chunk
-            for kind, chunk in segment_cell(body)
+
+        # delimited maths first, so "\(x\)" is not mistaken for the control
+        # sequence "\(" by the bare-LaTeX scanner
+        body = _DELIMITED.sub(
+            lambda d: make_equation(next(g for g in d.groups() if g is not None).strip()),
+            body,
         )
-        return f"{open_tag}{rebuilt}{close_tag}"
+        # then bare LaTeX, stepping over any placeholder already present
+        out, prev = [], 0
+        for p in _PLACEHOLDER.finditer(body):
+            out.append(rewrite_plain(body[prev:p.start()]))
+            out.append(p.group(0))
+            prev = p.end()
+        out.append(rewrite_plain(body[prev:]))
+        return f"{open_tag}{''.join(out)}{close_tag}"
 
     return _CELL_TEXT.sub(cell, table_html)
+
+
+# ── Markdown pipe tables ──────────────────────────────────────────────────
+
+# A row: starts and ends with '|'. The separator row is all dashes and colons.
+_PIPE_ROW = re.compile(r"^\s*\|(.+)\|\s*$")
+_PIPE_SEP = re.compile(r"^[\s|:-]+$")
+
+
+def _split_row(line: str) -> list[str]:
+    inner = _PIPE_ROW.match(line)
+    return [c.strip() for c in inner.group(1).split("|")] if inner else []
+
+
+def looks_like_pipe_table(text: str) -> bool:
+    """A Markdown table needs a header row, a `---` separator, and a body row."""
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    if len(lines) < 3:
+        return False
+    if not all(_PIPE_ROW.match(ln) for ln in lines):
+        return False
+    return bool(_PIPE_SEP.match(lines[1])) and "-" in lines[1]
+
+
+def pipe_table_to_html(text: str) -> Optional[str]:
+    """
+    Convert a Markdown pipe table to table markup, or None if `text` is not one.
+
+    Emits the same bare `<table>` shape MinerU produces, so it flows through
+    `s10_epub_assembly._valid_table_html` and the placeholder substitution
+    unchanged. Ragged rows are padded rather than rejected — the VLM's
+    transcription is not always square, and dropping the table would be worse
+    than an empty trailing cell.
+    """
+    if not looks_like_pipe_table(text):
+        return None
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    header = _split_row(lines[0])
+    body = [_split_row(ln) for ln in lines[2:]]
+    width = max([len(header)] + [len(r) for r in body])
+
+    def row(cells: list[str], tag: str) -> str:
+        cells = cells + [""] * (width - len(cells))
+        return "<tr>" + "".join(f"<{tag}>{c}</{tag}>" for c in cells) + "</tr>"
+
+    return "<table>" + row(header, "th") + "".join(row(r, "td") for r in body) + "</table>"

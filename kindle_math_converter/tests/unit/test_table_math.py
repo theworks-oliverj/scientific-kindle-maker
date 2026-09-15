@@ -123,3 +123,97 @@ def test_cells_containing_nested_markup_are_left_alone():
     those keep the current behaviour rather than being half-processed."""
     html = r"<table><tr><td><b>\alpha</b></td></tr></table>"
     assert substitute_table_math(html, lambda x: "[[EQ:x]]") == html
+
+
+# ── Markdown pipe tables ──────────────────────────────────────────────────
+# MinerU's VLM transcribes a table-shaped figure as GFM, which lands in a <p>.
+# Peliti shipped 27 of these, Hartmann 76 — verbatim shapes below.
+
+PIPE_TABLE = (
+    "| Time Interval | State Value |\n"
+    "| --- | --- |\n"
+    "| t0 to t1 | x0 |\n"
+    "| t1 to t2 | x1 |"
+)
+
+
+def test_a_markdown_pipe_table_is_recognised():
+    from kindle_math_converter.table_math import looks_like_pipe_table
+    assert looks_like_pipe_table(PIPE_TABLE)
+
+
+def test_ordinary_prose_is_not_mistaken_for_a_table():
+    from kindle_math_converter.table_math import looks_like_pipe_table
+    for text in [
+        "This sentence | has a pipe but is not a table.",
+        "| only | a | header |",
+        "| head |\n| --- |",
+        "Normal paragraph text.",
+        "",
+    ]:
+        assert not looks_like_pipe_table(text), text
+
+
+def test_pipe_table_becomes_table_markup():
+    from kindle_math_converter.table_math import pipe_table_to_html
+    html = pipe_table_to_html(PIPE_TABLE)
+    assert html is not None
+    assert html.startswith("<table>") and html.endswith("</table>")
+    assert html.count("<tr>") == 3
+    assert "<th>Time Interval</th>" in html
+    assert "<td>t0 to t1</td>" in html
+    assert "---" not in html, "separator row leaked into the output"
+
+
+def test_ragged_rows_are_padded_rather_than_dropped():
+    from kindle_math_converter.table_math import pipe_table_to_html
+    html = pipe_table_to_html("| a | b | c |\n| --- | --- | --- |\n| 1 |")
+    assert html is not None
+    assert html.count("<td>") == 3, "short row should be padded to full width"
+
+
+def test_non_table_text_converts_to_none():
+    from kindle_math_converter.table_math import pipe_table_to_html
+    assert pipe_table_to_html("just a paragraph") is None
+
+
+def test_maths_inside_a_recovered_pipe_table_is_registered():
+    from kindle_math_converter.table_math import pipe_table_to_html
+    seen = []
+
+    def make(latex):
+        seen.append(latex)
+        return f"[[EQ:e{len(seen)}]]"
+
+    html = pipe_table_to_html("| t | w (k_B T) |\n| --- | --- |\n| 0 | 25 |")
+    assert html is not None
+    out = substitute_table_math(html, make)
+    assert seen, "bare LaTeX in a recovered table was not registered"
+    assert "[[EQ:e1]]" in out
+
+
+def test_delimited_maths_is_registered_with_delimiters_stripped():
+    """MinerU writes \\(...\\) when transcribing Markdown; pasted HTML may use
+    $...$. Both must reach the equation pipeline as bare LaTeX."""
+    seen = []
+
+    def make(latex):
+        seen.append(latex)
+        return "[[EQ:d]]"
+
+    out = substitute_table_math(
+        r"<table><tr><td>\(\Delta x\)</td><td>$y^2$</td></tr></table>", make)
+    assert seen == [r"\Delta x", "y^2"], seen
+    assert "\\(" not in out and "$" not in out
+
+
+def test_an_existing_placeholder_is_not_reparsed():
+    """s02c substitutes MathJax before the table is built, so cells can already
+    hold placeholders. The underscore in "[[EQ:eq_1]]" must not be read as a
+    subscript and re-registered."""
+    calls = []
+    out = substitute_table_math(
+        "<table><tr><td>[[EQ:eq_1]]</td></tr></table>",
+        lambda tex: calls.append(tex) or "[[EQ:new]]")
+    assert calls == [], f"placeholder was re-parsed as maths: {calls}"
+    assert "[[EQ:eq_1]]" in out
