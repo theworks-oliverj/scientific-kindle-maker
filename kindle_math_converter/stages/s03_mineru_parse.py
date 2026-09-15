@@ -51,6 +51,7 @@ from ..equation_filters import (
     simple_text_repr,
 )
 from ..models.document import BoundingBox, Document, EquationRegion, FigureBlock, Page, TextBlock
+from ..table_math import substitute_table_math
 from ..models.enums import FormulaClass
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
@@ -530,6 +531,44 @@ def run(
                                     table_html = s["html"]
                     else:
                         harvest_text_block(sub, block_order, sub.get("bbox", bbox_pts))
+
+                # MinerU leaves a table's maths as bare, undelimited LaTeX in
+                # the cells. Register each run as an ordinary inline equation so
+                # it flows through s06 -> s07 -> s08a like any other and renders,
+                # instead of serializing as literal "\\langle \\ldots \\rangle".
+                # (The EPUB path does the same in s02c._substitute_table_math,
+                # but keys on MathJax delimiters, which MinerU never emits.)
+                if table_html:
+                    def _register_table_eq(latex: str) -> str:
+                        nonlocal eq_counter, n_inline, n_rendered_as_text
+                        eq_counter += 1
+                        region_id = f"eq_{page_number}_{eq_counter}"
+                        text_repr = simple_text_repr(latex)
+                        page.equation_regions.append(EquationRegion(
+                            region_id=region_id,
+                            bbox=_pixel_bbox(body_bbox or bbox_pts, sx, sy, page_number),
+                            # INLINE: a display equation inside a <td> would emit
+                            # <p> tags that s10 has to strip back out again.
+                            formula_class=FormulaClass.INLINE,
+                            source_image_crop=None,
+                            raw_latex=latex,
+                            normalized_latex=None, cdm_score=None, confidence_gate=None,
+                            svg=None, svg_postprocessed=None,
+                            equation_number=None,
+                            reading_order_index=block_order,
+                            render_as_text=text_repr is not None,
+                            inline_text_repr=text_repr,
+                        ))
+                        n_inline += 1
+                        if text_repr is not None:
+                            n_rendered_as_text += 1
+                        return eq_placeholder(region_id)
+
+                    before = eq_counter
+                    table_html = substitute_table_math(table_html, _register_table_eq)
+                    if eq_counter > before:
+                        bus.emit(STAGE, "table_equations_found",
+                                 page=page_number, count=eq_counter - before)
 
                 fig_bytes = (
                     _crop_png(page_img, body_bbox or bbox_pts, sx, sy)
