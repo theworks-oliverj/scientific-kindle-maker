@@ -30,7 +30,7 @@ License: [AGPL-3.0](LICENSE) — see
 8. [Troubleshooting](#8-troubleshooting)
 9. [Known limitations](#9-known-limitations)
    - [Amazon's per-book equation limit](#amazons-per-book-equation-limit) — why a big textbook comes out as several volumes
-   - [MathML migration — status and the `\mathrm` problem](#mathml-migration--status-and-the-mathrm-problem)
+   - [MathML — evaluated and rejected as the output format](#mathml--evaluated-and-rejected-as-the-output-format)
    - [Tests and CI](#9b-tests-and-ci)
 10. [License and third-party components](#10-license-and-third-party-components)
 
@@ -1636,41 +1636,49 @@ A 3,000-equation textbook becomes four volumes. That is a real cost —
 cross-volume links do not resolve and the book occupies four library slots — but
 the alternative is a book that cannot be delivered at all.
 
-### MathML migration — status and the `\mathrm` problem
+### MathML — evaluated and rejected as the output format
 
-Equations currently ship as **inline SVG** (dvisvgm glyph outlines). That is a
-vector *picture* of the equation: it scales cleanly, but it is not selectable,
-reflowable, or accessible text. **MathML** would be — and it would also sidestep
+Equations ship as **inline SVG** (dvisvgm glyph outlines). SVG is a vector
+*picture* of the equation, not selectable or reflowable text — **MathML** would
+be, and it would also sidestep
 [Amazon's per-book equation limit](#amazons-per-book-equation-limit) entirely,
-since that ceiling counts `<svg>` elements specifically.
+since that ceiling counts `<svg>` elements specifically. Both a full switch to
+MathML and a per-book hybrid (SVG up to the volume budget, MathML for the
+overflow) were evaluated (2026-09) and **rejected in favor of the existing SVG +
+volume-splitting path.**
 
-Confirmed so far, by upload:
+What was confirmed, by upload:
 
 - A book carrying **3,125 MathML equations converts** where the same book with
   3,125 SVG equations fails. The ceiling really is SVG-specific.
 - `latex2mathml` converts **100%** of a 3,899-equation corpus without raising.
 
-**Not yet adopted, because of a known fidelity regression:**
+What ruled it out:
 
-> `latex2mathml` renders `\mathrm{d}` as `<mi>d</mi>` with **no
-> `mathvariant="normal"`**, so upright operators come out *italic*. Every
-> differential (`dx`, `dt`) and every upright superscript is affected —
-> **1,128 of 3,899 equations (29%)** in the reference corpus.
+- **A real, unbuilt fidelity regression.** `latex2mathml` renders `\mathrm{d}`
+  as `<mi>d</mi>` with no `mathvariant="normal"`, so upright operators —
+  including every differential (`dx`, `dt`) — come out *italic*. Measured at
+  **1,128 of 3,899 equations (29%)** in the reference corpus. Fixable with a
+  post-processing pass over the generated MathML, but that pass does not exist,
+  and shipping without it would make output typographically worse than today.
+- **No equivalent to the CDM quality gate.** The SVG path can render an
+  equation to a PNG and diff it against the source crop; there is nothing to
+  diff a MathML string against short of a real device screenshot. Switching
+  formats means losing the one automated correctness check equations get.
+- **Unverified on-device rendering.** "Converts without error" is not "renders
+  correctly" — Kindle's MathML support is historically uneven, and `\mathcal`
+  (9% of the corpus), `\boldsymbol` (4%) and multi-line `\begin{array}` blocks
+  (2%), plus equation numbering/alignment, were never visually spot-checked on
+  a device.
+- **Most books never approach the ceiling.** `KINDLE_MAX_EQUATIONS_PER_VOLUME`
+  (900) is well under the measured 1,054-pass point, so only unusually
+  equation-dense books split at all, and typically into 2–3 volumes, not the
+  4 seen in the Peliti stress test. A hybrid renderer would add a second output
+  format, a second set of on-device failure modes, and an intra-book visual
+  seam at the split point — real ongoing complexity — to help a minority of
+  books shave off one extra volume. Not judged worth it.
 
-This is fixable with a post-processing pass over the generated MathML (set
-`mathvariant="normal"` on `<mi>` elements derived from `\mathrm`/`\text`), but
-it must be done before MathML can replace SVG, or the output is typographically
-worse than today despite being structurally better.
-
-Also unverified, and worth checking before committing to a switch:
-
-- **Rendering quality on device.** "Converts without error" is not "renders
-  correctly" — Kindle's MathML support is historically uneven. `\mathcal` (9% of
-  the corpus), `\boldsymbol` (4%) and multi-line `\begin{array}` blocks (2%) need
-  visual spot-checks.
-- **Equation numbering and alignment** in multi-line environments.
-
-Until those are settled, SVG plus volume splitting remains the shipping path.
+SVG plus volume splitting is the shipping path, not an interim one.
 
 **Handwritten equations** — not supported. MinerU is trained on typeset
 academic documents.
