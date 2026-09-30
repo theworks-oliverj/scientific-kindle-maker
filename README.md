@@ -29,6 +29,8 @@ License: [AGPL-3.0](LICENSE) — see
 7. [The pipeline — what happens inside](#7-the-pipeline--what-happens-inside)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Known limitations](#9-known-limitations)
+   - [Amazon's per-book equation limit](#amazons-per-book-equation-limit) — why a big textbook comes out as several volumes
+   - [MathML — evaluated and rejected as the output format](#mathml--evaluated-and-rejected-as-the-output-format)
    - [Tests and CI](#9b-tests-and-ci)
 10. [License and third-party components](#10-license-and-third-party-components)
 
@@ -201,6 +203,10 @@ handle yet (non-standard footnote markup, interactive/canvas content).
   see [Local runs are reproducible; GPU runs are not](#local-runs-are-reproducible-gpu-runs-are-not).
 - **Everything is checked at the end.** `epubcheck` runs automatically and is
   fatal, so a completed run means a structurally valid EPUB.
+- **A very equation-heavy book comes out as several volumes.** Amazon's
+  converter rejects a book with too many equations outright, so books over the
+  limit are split into `1_of_N_{title}.epub` files — send each to your Kindle.
+  See [Amazon's per-book equation limit](#amazons-per-book-equation-limit).
 
 ---
 
@@ -1026,6 +1032,19 @@ The converted book. Send this to your Kindle via the
 [Send to Kindle](https://www.amazon.com/sendtokindle) website or app.
 Amazon converts it to their internal KFX format automatically.
 
+### `1_of_N_{title}.epub`, `2_of_N_{title}.epub`, … (equation-heavy books only)
+
+If the book contains more equations than Amazon's converter accepts, you get a
+numbered set of volumes **instead of** a single `{title}.epub`. Send each one to
+your Kindle; they appear as separate books in your library, in reading order.
+
+The volume marker leads the filename so a split book is obvious at a glance and
+the parts sort correctly in any file listing.
+
+This is not a cosmetic choice — see
+[Amazon's per-book equation limit](#amazons-per-book-equation-limit) for why a
+book over the limit cannot be delivered as one file at all.
+
 ### `{title}_report.html`
 
 Open this in any browser. It contains:
@@ -1226,6 +1245,10 @@ Stage 2 — Extraction  (two variants)
                    equations from <math> (MathML) and equation-like <img>
                    elements, both with placeholders spliced into the
                    surrounding text exactly like Stage 3 does for PDFs.
+                   A Markdown pipe table sitting in a paragraph is recovered
+                   into real table markup here too — same shared code as the
+                   PDF path, so content generated from Markdown behaves the
+                   same whichever door it comes in through.
     │
     ▼
 Stage 3 — MinerU parse  (PDF only)
@@ -1237,6 +1260,14 @@ Stage 3 — MinerU parse  (PDF only)
     raster.
     Reuses any parse already on disk, which is what makes a GPU-parsed book
     and a resumed run both work.
+    Two table repairs happen here, both shared with the EPUB/HTML path
+    (kindle_math_converter/table_math.py):
+      • maths in table cells. MinerU leaves it as bare, undelimited LaTeX,
+        which would otherwise reach the reader as "\langle \ldots \rangle".
+        Each run is registered as an ordinary equation and renders normally.
+      • a table the VLM transcribed as a Markdown pipe table, which lands in
+        a paragraph and reads as literal pipes and dashes. Recovered into
+        real table markup, then its maths is registered the same way.
     ► Fatal if a batch fails; completed batches survive for the re-run.
     │
     ▼
@@ -1323,6 +1354,36 @@ Stage 11 — Output
 ---
 
 ## 8. Troubleshooting
+
+### Send to Kindle says "Failed. Please retry." (error E999)
+
+E999 is Amazon's generic conversion failure and carries no diagnostic. Two
+causes are known, both now handled by the pipeline:
+
+1. **Too many equations in one book.** Amazon rejects a book above roughly
+   1,100 inline `<svg>` elements. Output built by a current version of this
+   pipeline is split into `1_of_N_{title}.epub` volumes automatically — send
+   each volume separately. See
+   [Amazon's per-book equation limit](#amazons-per-book-equation-limit).
+2. **A `>` character in figure alt text.** Amazon's parser scans for `>` to end
+   an `<img>` tag without honouring quoted attributes, so a single `>` anywhere
+   in alt text fails the entire book. Fixed in `s10_epub_assembly`.
+
+Note that **`epubcheck` and Kindle Previewer both pass files that E999** — a
+clean local validation does not mean Amazon will accept it.
+
+To see a real error instead of E999, convert locally with
+[Kindle Previewer 3](https://www.amazon.com/Kindle-Previewer/b?node=21381691011):
+
+```bash
+"/Applications/Kindle Previewer 3.app/Contents/MacOS/Kindle Previewer 3" \
+    book.epub -convert -output ./kpout
+cat ./kpout/Logs/book_log.csv
+```
+
+It emits named errors (e.g. `E21018`) with a source file and line number. It
+will **not** reproduce the equation-count limit, but it catches most other
+conversion failures in seconds rather than a 20-minute upload round-trip.
 
 ### Installation errors
 
@@ -1528,6 +1589,96 @@ Open `{title}_report.html` in any browser. Key things to look for:
 ---
 
 ## 9. Known limitations
+
+### Amazon's per-book equation limit
+
+**Amazon's Send to Kindle converter rejects a book containing too many
+equations, with a generic `E999` and no explanation.** This is a limit in
+Amazon's service, not a bug in this pipeline, and there is no way to work around
+it other than splitting the book.
+
+Measured by bisection across 15 real uploads (2026-09):
+
+| inline `<svg>` elements in the book | Send to Kindle |
+|---|---|
+| 1,054 | converts |
+| 1,342 | **E999** |
+
+The ceiling counts inline `<svg>` **elements per book** and nothing else. Each of
+these was ruled out by a direct pass/fail inversion — a larger value succeeding
+while a smaller one failed:
+
+| ruled out | evidence |
+|---|---|
+| compressed EPUB size | 3.44 MB passed, 3.03 MB failed |
+| uncompressed bytes | 17.87 MB passed, 1.13 MB failed |
+| number of XHTML files | 180 passed, 61 failed |
+| files containing SVG | 180 passed, 20 failed |
+| number of images | 44 passed, 22 failed |
+| tables | a full book with every table stripped still failed |
+
+Amazon's published 200 MB limit is irrelevant here — the books that fail are
+7 MB. KFX conversion expands a book by a uniform ~2.3× regardless of equation
+density, so there is no hidden size blow-up either.
+
+**`epubcheck` and Kindle Previewer both accept the oversized books.** Previewer
+reports `Supported / Success / 0 errors` on a file Send to Kindle then rejects,
+so no local tool catches this. Staying under budget is the only protection.
+
+**What the pipeline does:** `s10_epub_assembly` counts inline `<svg>` per chapter
+and, above `KINDLE_MAX_EQUATIONS_PER_VOLUME` (900 — below the 1,054 known to
+pass), splits the book into `1_of_N_{title}.epub` volumes. Cuts land only on
+chapter boundaries, so no section is torn in half, and each volume gets its own
+identifier so Kindle does not deduplicate one against another. Books under the
+limit are unaffected and still produce a single file.
+
+A 3,000-equation textbook becomes four volumes. That is a real cost —
+cross-volume links do not resolve and the book occupies four library slots — but
+the alternative is a book that cannot be delivered at all.
+
+### MathML — evaluated and rejected as the output format
+
+Equations ship as **inline SVG** (dvisvgm glyph outlines). SVG is a vector
+*picture* of the equation, not selectable or reflowable text — **MathML** would
+be, and it would also sidestep
+[Amazon's per-book equation limit](#amazons-per-book-equation-limit) entirely,
+since that ceiling counts `<svg>` elements specifically. Both a full switch to
+MathML and a per-book hybrid (SVG up to the volume budget, MathML for the
+overflow) were evaluated (2026-09) and **rejected in favor of the existing SVG +
+volume-splitting path.**
+
+What was confirmed, by upload:
+
+- A book carrying **3,125 MathML equations converts** where the same book with
+  3,125 SVG equations fails. The ceiling really is SVG-specific.
+- `latex2mathml` converts **100%** of a 3,899-equation corpus without raising.
+
+What ruled it out:
+
+- **A real, unbuilt fidelity regression.** `latex2mathml` renders `\mathrm{d}`
+  as `<mi>d</mi>` with no `mathvariant="normal"`, so upright operators —
+  including every differential (`dx`, `dt`) — come out *italic*. Measured at
+  **1,128 of 3,899 equations (29%)** in the reference corpus. Fixable with a
+  post-processing pass over the generated MathML, but that pass does not exist,
+  and shipping without it would make output typographically worse than today.
+- **No equivalent to the CDM quality gate.** The SVG path can render an
+  equation to a PNG and diff it against the source crop; there is nothing to
+  diff a MathML string against short of a real device screenshot. Switching
+  formats means losing the one automated correctness check equations get.
+- **Unverified on-device rendering.** "Converts without error" is not "renders
+  correctly" — Kindle's MathML support is historically uneven, and `\mathcal`
+  (9% of the corpus), `\boldsymbol` (4%) and multi-line `\begin{array}` blocks
+  (2%), plus equation numbering/alignment, were never visually spot-checked on
+  a device.
+- **Most books never approach the ceiling.** `KINDLE_MAX_EQUATIONS_PER_VOLUME`
+  (900) is well under the measured 1,054-pass point, so only unusually
+  equation-dense books split at all, and typically into 2–3 volumes, not the
+  4 seen in the Peliti stress test. A hybrid renderer would add a second output
+  format, a second set of on-device failure modes, and an intra-book visual
+  seam at the split point — real ongoing complexity — to help a minority of
+  books shave off one extra volume. Not judged worth it.
+
+SVG plus volume splitting is the shipping path, not an interim one.
 
 **Handwritten equations** — not supported. MinerU is trained on typeset
 academic documents.

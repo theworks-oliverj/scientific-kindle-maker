@@ -264,7 +264,10 @@ class Pipeline:
 
         # Stage 11: Output and delivery
         cache_dump = self.cache.dump() if cfg.dump_cache else None
-        sr11 = s11_output.run(epub_path, result, document, self.bus, out_dir, cache_dump)
+        sr11 = s11_output.run(
+            epub_path, result, document, self.bus, out_dir, cache_dump,
+            volume_paths=sr10.metrics.get("volume_paths"),
+        )
         result.stage_results.append(sr11)
 
         return document

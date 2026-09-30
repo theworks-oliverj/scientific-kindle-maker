@@ -51,6 +51,7 @@ from ..equation_filters import (
     simple_text_repr,
 )
 from ..models.document import BoundingBox, Document, EquationRegion, FigureBlock, Page, TextBlock
+from ..table_math import pipe_table_to_html, substitute_table_math
 from ..models.enums import FormulaClass
 from ..models.results import StageResult
 from ..observability.event_bus import EventBus
@@ -391,6 +392,53 @@ def run(
         page_img, sx, sy = _page_image_and_scale(page, page_info.get("page_size", [612, 792]))
         eq_counter = 0
 
+        def register_table_equation(latex: str, bbox_pts: list, block_order) -> str:
+            """Register one equation found inside table markup and return its
+            placeholder. INLINE deliberately: a display equation inside a <td>
+            emits <p> tags that s10 then has to strip back out."""
+            nonlocal eq_counter, n_inline, n_rendered_as_text
+            eq_counter += 1
+            region_id = f"eq_{page_number}_{eq_counter}"
+            text_repr = simple_text_repr(latex)
+            page.equation_regions.append(EquationRegion(
+                region_id=region_id,
+                bbox=_pixel_bbox(bbox_pts, sx, sy, page_number),
+                formula_class=FormulaClass.INLINE,
+                source_image_crop=None,
+                raw_latex=latex,
+                normalized_latex=None, cdm_score=None, confidence_gate=None,
+                svg=None, svg_postprocessed=None,
+                equation_number=None,
+                reading_order_index=block_order,
+                render_as_text=text_repr is not None,
+                inline_text_repr=text_repr,
+            ))
+            n_inline += 1
+            if text_repr is not None:
+                n_rendered_as_text += 1
+            return eq_placeholder(region_id)
+
+        def emit_pipe_table(raw_text: str, bbox_pts: list, block_order) -> bool:
+            """MinerU's VLM often transcribes a table-shaped figure as a
+            Markdown pipe table, which would otherwise reach the reader as
+            literal pipes and dashes in a paragraph. Recover it as a real
+            table and route its maths through the normal pipeline."""
+            html = pipe_table_to_html(raw_text)
+            if html is None:
+                return False
+            html = substitute_table_math(
+                html, lambda tex: register_table_equation(tex, bbox_pts, block_order))
+            page.figures.append(FigureBlock(
+                figure_id=f"fig_{page_number}_{len(page.figures) + 1}",
+                bbox=_pixel_bbox(bbox_pts, sx, sy, page_number),
+                image_bytes=None,
+                alt_text="table",
+                reading_order_index=block_order,
+                table_html=html,
+            ))
+            bus.emit(STAGE, "markdown_table_recovered", page=page_number)
+            return True
+
         def harvest_text_block(
             block: dict, block_order, bbox_pts: list, kind: str = "text"
         ) -> None:
@@ -457,6 +505,8 @@ def run(
 
             raw_text = " ".join(parts).strip()
             if not raw_text:
+                return
+            if emit_pipe_table(raw_text, bbox_pts, block_order):
                 return
             page.text_blocks.append(
                 TextBlock(
@@ -530,6 +580,23 @@ def run(
                                     table_html = s["html"]
                     else:
                         harvest_text_block(sub, block_order, sub.get("bbox", bbox_pts))
+
+                # MinerU leaves a table's maths as bare, undelimited LaTeX in
+                # the cells. Register each run as an ordinary inline equation so
+                # it flows through s06 -> s07 -> s08a like any other and renders,
+                # instead of serializing as literal "\\langle \\ldots \\rangle".
+                # (The EPUB path does the same in s02c._substitute_table_math,
+                # but keys on MathJax delimiters, which MinerU never emits.)
+                if table_html:
+                    before = eq_counter
+                    table_html = substitute_table_math(
+                        table_html,
+                        lambda tex: register_table_equation(
+                            tex, body_bbox or bbox_pts, block_order),
+                    )
+                    if eq_counter > before:
+                        bus.emit(STAGE, "table_equations_found",
+                                 page=page_number, count=eq_counter - before)
 
                 fig_bytes = (
                     _crop_png(page_img, body_bbox or bbox_pts, sx, sy)

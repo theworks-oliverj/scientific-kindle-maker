@@ -69,6 +69,7 @@ def run(
     event_bus: EventBus,
     output_dir: Path,
     cache_dump: list[dict] | None = None,
+    volume_paths: list[str] | None = None,
 ) -> StageResult:
     t0 = time.perf_counter()
     stage = "s11_output"
@@ -83,9 +84,29 @@ def run(
         output_dir.mkdir(parents=True, exist_ok=True)
         stem = Path(result.document_path).stem
 
-        # Copy EPUB to final location
+        # Copy EPUB to final location. An equation-heavy book is split by s10
+        # into several volumes (see KINDLE_MAX_EQUATIONS_PER_VOLUME) and every
+        # one has to be delivered, not just the path s10 handed back. s10 passes
+        # the list explicitly — deriving it by globbing the output directory
+        # would be guesswork about filenames.
         final_epub = output_dir / f"{stem}.epub"
-        if epub_path.exists():
+        volumes = [Path(p) for p in (volume_paths or [])]
+        if len(volumes) > 1:
+            delivered = []
+            total = len(volumes)
+            for i, vol in enumerate(volumes, 1):
+                # volume marker first: obvious at a glance, sorts in reading order
+                dst = output_dir / f"{i}_of_{total}_{stem}.epub"
+                shutil.copy2(str(vol), str(dst))
+                delivered.append(dst)
+            result.output_epub_path = str(delivered[0])
+            warnings.append(
+                f"book exceeded Kindle's per-book equation limit; delivered "
+                f"{total} volumes: {', '.join(p.name for p in delivered)}"
+            )
+            log.info("delivered_volumes", count=total)
+            final_epub = delivered[0]
+        elif epub_path.exists():
             shutil.copy2(str(epub_path), str(final_epub))
             result.output_epub_path = str(final_epub)
 
